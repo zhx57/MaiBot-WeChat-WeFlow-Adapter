@@ -5,13 +5,13 @@
   "name": "Akasha WeChat WeFlow 适配器",
   "description": "把微信（经 WeFlow SSE）接入 MaiBot 的双工消息网关适配器，移植自 Akasha-WeChat。",
   "author": {
-    "name": "Akasha",
-    "url": "https://github.com/alingalingling/Akasha-WeChat"
+    "name": "zhx57",
+    "url": "https://github.com/zhx57"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/alingalingling/Akasha-WeChat",
-    "issues": "https://github.com/alingalingling/Akasha-WeChat/issues"
+    "repository": "https://github.com/zhx57/MaiBot-WeChat-WeFlow-Adapter",
+    "issues": "https://github.com/zhx57/MaiBot-WeChat-WeFlow-Adapter/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -27,7 +27,6 @@
     { "type": "python_package", "name": "pyperclip", "version_spec": ">=1.8.2" },
     { "type": "python_package", "name": "uiautomation", "version_spec": ">=2.0.17" }
   ],
-  "plugin_type": "adapter",
   "capabilities": ["send_message"],
   "i18n": {
     "default_locale": "zh-CN",

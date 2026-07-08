@@ -26,7 +26,7 @@ from maibot_sdk import (
 from .bridge import WeChatBridge
 from .codecs.outbound import iter_send_actions, resolve_contact
 from .config import WeChatWeFlowConfig
-from .constants import DATA_DIR, GATEWAY_NAME, ID_MAP_FILENAME, PLATFORM, PROTOCOL, SCOPE
+from .constants import GATEWAY_NAME, ID_MAP_FILENAME, PLATFORM, PROTOCOL, SCOPE
 from .id_mapping import ContactMapper
 
 
@@ -54,8 +54,8 @@ class WeChatWeFlowAdapterPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         """Runner 注入 ctx 后调用：初始化数据目录、映射与桥接。"""
 
-        # 1. 数据目录：插件根目录下的 data 子目录
-        data_dir = Path(__file__).parent / DATA_DIR
+        # 1. 数据目录：使用 ctx.paths.data_dir（Host 管理的持久化目录）
+        data_dir = self.ctx.paths.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self._data_dir = data_dir
 
@@ -124,8 +124,7 @@ class WeChatWeFlowAdapterPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
 
-        # 显式更新内部配置（NapCat 模式），调用后 self.config 反映新值
-        self.set_plugin_config(config_data)
+        # self.config 在 scope="self" 时已由 SDK 自动更新，无需手动重读
         self.ctx.logger.info("WeChat WeFlow 适配器配置已更新: version=%s", version)
 
         # 重启桥接以应用新配置（安全且正确）
@@ -156,7 +155,7 @@ class WeChatWeFlowAdapterPlugin(MaiBotPlugin):
         # 3. 重建 ContactMapper 并加载持久化映射
         if self._data_dir is None:
             # on_load 尚未执行过的兜底（理论上不会发生）
-            self._data_dir = Path(__file__).parent / DATA_DIR
+            self._data_dir = self.ctx.paths.data_dir
             self._data_dir.mkdir(parents=True, exist_ok=True)
 
         contact_mapper = ContactMapper()
