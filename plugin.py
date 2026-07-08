@@ -73,7 +73,13 @@ class WeChatWeFlowAdapterPlugin(MaiBotPlugin):
             data_dir=data_dir,
         )
 
-        # 4. 按配置启用
+        # 4. 配置自校验
+        if self.config.plugin.enabled:
+            if not self.config.validate_runtime_config(self.ctx.logger):
+                self.ctx.logger.error("配置校验未通过，桥接不启动，请按上方告警修正配置后重载插件")
+                return
+
+        # 5. 按配置启用
         if self.config.plugin.enabled:
             await self._bridge.start()
         else:

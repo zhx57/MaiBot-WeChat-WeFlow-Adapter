@@ -1,89 +1,82 @@
 # Akasha WeChat WeFlow 适配器配置示例
-# 把微信（经 WeFlow SSE）接入 MaiBot 的双工消息网关适配器。
-# 字段含义与默认值与 config.py 中 WeChatWeFlowConfig 一致。
+# 把微信（经 WeFlow）接入 MaiBot 的适配器插件。
+# 也可以不编辑此文件，直接在 MaiBot WebUI 的插件配置页用中文表单填写。
 
-# 插件基础设置
+# ============ 插件基础设置 ============
 [plugin]
-# 是否启用适配器
+# 是否启用这个微信适配器插件（关掉后插件不工作）
 enabled = true
-# 配置版本号
+# 配置版本号（一般不用改）
 config_version = "1.0.0"
 
-# WeFlow 连接设置
+# ============ WeFlow 连接设置 ============
 [weflow]
-# WeFlow API 根地址
+# WeFlow 软件运行的地址，本机用一般是 http://127.0.0.1:5031
 base_url = "http://127.0.0.1:5031"
-# WeFlow Access Token
+# WeFlow 访问令牌，在 WeFlow 软件的「设置 → API 服务」里复制
 access_token = ""
-# WeFlow 发送消息 API 地址
+# 用 WeFlow 接口发消息时的地址（用 UIA 发送时无需关心）
 send_api = "http://127.0.0.1:5031/api/v1/message"
-# 发送方式：uia=Windows UI 自动化，weflow_api=WeFlow REST API
+# 消息发送方式：uia=用 Windows 自动化操作微信窗口发消息（推荐）；
+#              weflow_api=用 WeFlow 接口发消息（需第三方扩展支持）
 send_method = "uia"
-# HTTP 请求超时（秒）
+# 和 WeFlow 通信的超时时间（秒）
 request_timeout = 30.0
 
-# 机器人设置
+# ============ 微信机器人设置 ============
 [bot]
-# 机器人微信昵称列表，群聊 @ 检测与自回复过滤用
+# 机器人微信昵称，用于识别群里@机器人和过滤自己发的消息。可填多个
 nicknames = []
-# 机器人自身 wxid（self_id），自回复过滤用
+# 机器人微信号的唯一ID（wxid_xxx），在 WeFlow 里能看到。用于标识机器人自己
 wxid = ""
 
-# 桥接设置
+# ============ 消息处理设置 ============
 [bridge]
-# 消息缓冲秒数，多条消息合并后推送
+# 群里连续发多条消息时，等几秒合并成一条再交给 AI，避免刷屏
 buffer_seconds = 5
-# 群聊回复模式：mention=仅@回复，all=全部回复，batch=批处理
+# 群聊回复模式：mention=只在被@时回复；all=群里每条消息都回复；batch=把群里消息合并成一条处理
 group_reply_mode = "mention"
-# SSE 断线重连间隔（秒）
+# 和 WeFlow 断开后等多久再重连（秒）
 reconnect_delay_sec = 10
-# 是否丢弃启动前的历史消息
+# 是否忽略插件启动前就收到的历史消息（避免 AI 回复旧消息）
 history_filter_enabled = true
 
-# 图片描述设置
+# ============ 图片理解设置 ============
 [image_caption]
-# 图片描述服务：none=不描述（仅转发图片）；maibot=复用 MaiBot Host 已配置模型（推荐）；
-#              ollama=本地 Ollama；openai=OpenAI 兼容
-provider = "none"
-# 视觉模型名。provider=maibot 时留空用 Host 默认；ollama 如 llava:7b；openai 如 gpt-4o
-model = "llava:7b"
-# OpenAI 兼容模式 API Key
-api_key = ""
-# OpenAI 兼容 API 根地址
-api_base = "https://api.moonshot.cn/v1"
-# 视觉模型提示词
+# 是否启用图片理解。开启后机器人能看懂图片。
+# 需先在 MaiBot「模型配置」页配置一个支持看图的模型（如 gpt-4o、qwen-vl-plus）
+enabled = false
+# 让视觉模型描述图片时使用的提示词（一般不用改）
 prompt = "请用中文简短描述这张图片的内容"
-# Ollama API 根地址
-ollama_base_url = "http://127.0.0.1:61000"
-# Ollama 请求超时（秒）
-ollama_timeout = 60
-# 是否下载图片并以 image 消息段转发给 MaiBot
+# 是否把图片以原图形式一起转发给 MaiBot（AI 看得更清楚但更耗流量）
 download_images = true
-# 图片保存子目录（相对插件 data 目录）
+# 下载的图片临时存放位置（一般不用改）
 attachments_dir = "wechat_images"
+# 等待视觉模型返回描述的最长时间（秒），超时就放弃避免卡住
+timeout = 60
 
-# 聊天名单设置
+# ============ 聊天名单设置 ============
 [chat]
-# 群聊名单类型
+# 群聊名单模式：whitelist=只响应名单里的群；blacklist=屏蔽名单里的群
 group_list_type = "whitelist"
-# 群聊名单（群名或群ID）
+# 群聊名单（群名或群ID），每行一个
 group_list = []
-# 私聊名单类型
+# 私聊名单模式：whitelist=只响应名单里的私聊；blacklist=屏蔽名单里的私聊
 private_list_type = "whitelist"
-# 私聊名单
+# 私聊名单（对方昵称或wxid），每行一个
 private_list = []
-# 封禁用户ID列表
+# 封禁用户列表（这些用户的消息会被完全忽略）
 ban_user_id = []
 
-# 过滤设置
+# ============ 过滤设置 ============
 [filters]
-# 是否忽略机器人自身消息
+# 是否忽略机器人自己发的消息（避免自己回复自己）
 ignore_self_message = true
-# 内容去重 TTL（秒），防止 AI 回复回流
+# 内容去重时间（秒），防止 AI 回复被 WeFlow 回流再次触发
 content_dedupe_ttl_sec = 120
 # 是否启用正则过滤
 regex_filter_enabled = false
-# 正则过滤模式
+# 正则过滤模式：blacklist=匹配的消息被屏蔽；whitelist=只有匹配的消息才处理
 regex_filter_mode = "blacklist"
-# 正则过滤模式列表
+# 正则表达式列表，每行一个
 regex_filter_patterns = []

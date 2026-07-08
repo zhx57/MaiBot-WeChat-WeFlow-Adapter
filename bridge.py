@@ -401,18 +401,13 @@ class WeChatBridge:
         injected_raw_message: list[dict[str, Any]] = []
 
         if image_path is not None:
-            # 视觉描述（provider != none 时）
-            if self._config.image_caption.provider != "none":
+            # 视觉描述（启用图片理解时）
+            if self._config.image_caption.enabled:
                 caption = await caption_image(
                     session,
                     image_path,
-                    self._config.image_caption.provider,
-                    self._config.image_caption.model,
-                    self._config.image_caption.api_key,
-                    self._config.image_caption.api_base,
                     self._config.image_caption.prompt,
-                    self._config.image_caption.ollama_base_url,
-                    self._config.image_caption.ollama_timeout,
+                    self._config.image_caption.timeout,
                     llm=self._ctx.llm,
                 )
                 injected_raw_message.append(

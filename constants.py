@@ -20,14 +20,10 @@ DEFAULT_REQUEST_TIMEOUT = 30.0
 DEFAULT_BUFFER_SECONDS = 5
 DEFAULT_RECONNECT_DELAY_SEC = 10
 
-# ============ Ollama 图片描述默认参数 ============
-DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:61000"
-DEFAULT_OLLAMA_TIMEOUT = 60
-
-# ============ 图片描述（OpenAI 兼容）默认参数 ============
-DEFAULT_IMAGE_CAPTION_MODEL = "llava:7b"
-DEFAULT_IMAGE_CAPTION_API_BASE = "https://api.moonshot.cn/v1"
+# ============ 图片描述默认参数 ============
 DEFAULT_IMAGE_CAPTION_PROMPT = "请用中文简短描述这张图片的内容"
+# VLM 描述超时秒数
+DEFAULT_IMAGE_CAPTION_TIMEOUT = 60
 
 # ============ 去重缓存默认参数 ============
 # 内容去重 TTL（防止 AI 回复回流）
