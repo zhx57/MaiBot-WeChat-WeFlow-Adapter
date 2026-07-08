@@ -1,0 +1,88 @@
+# Akasha WeChat WeFlow 适配器配置示例
+# 把微信（经 WeFlow SSE）接入 MaiBot 的双工消息网关适配器。
+# 字段含义与默认值与 config.py 中 WeChatWeFlowConfig 一致。
+
+# 插件基础设置
+[plugin]
+# 是否启用适配器
+enabled = true
+# 配置版本号
+config_version = "1.0.0"
+
+# WeFlow 连接设置
+[weflow]
+# WeFlow API 根地址
+base_url = "http://127.0.0.1:5031"
+# WeFlow Access Token
+access_token = ""
+# WeFlow 发送消息 API 地址
+send_api = "http://127.0.0.1:5031/api/v1/message"
+# 发送方式：uia=Windows UI 自动化，weflow_api=WeFlow REST API
+send_method = "uia"
+# HTTP 请求超时（秒）
+request_timeout = 30.0
+
+# 机器人设置
+[bot]
+# 机器人微信昵称列表，群聊 @ 检测与自回复过滤用
+nicknames = []
+# 机器人自身 wxid（self_id），自回复过滤用
+wxid = ""
+
+# 桥接设置
+[bridge]
+# 消息缓冲秒数，多条消息合并后推送
+buffer_seconds = 5
+# 群聊回复模式：mention=仅@回复，all=全部回复，batch=批处理
+group_reply_mode = "mention"
+# SSE 断线重连间隔（秒）
+reconnect_delay_sec = 10
+# 是否丢弃启动前的历史消息
+history_filter_enabled = true
+
+# 图片描述设置
+[image_caption]
+# 图片描述服务：none=不描述（仅转发图片），ollama，openai
+provider = "none"
+# 视觉模型名，如 llava:7b
+model = "llava:7b"
+# OpenAI 兼容模式 API Key
+api_key = ""
+# OpenAI 兼容 API 根地址
+api_base = "https://api.moonshot.cn/v1"
+# 视觉模型提示词
+prompt = "请用中文简短描述这张图片的内容"
+# Ollama API 根地址
+ollama_base_url = "http://127.0.0.1:61000"
+# Ollama 请求超时（秒）
+ollama_timeout = 60
+# 是否下载图片并以 image 消息段转发给 MaiBot
+download_images = true
+# 图片保存子目录（相对插件 data 目录）
+attachments_dir = "wechat_images"
+
+# 聊天名单设置
+[chat]
+# 群聊名单类型
+group_list_type = "whitelist"
+# 群聊名单（群名或群ID）
+group_list = []
+# 私聊名单类型
+private_list_type = "whitelist"
+# 私聊名单
+private_list = []
+# 封禁用户ID列表
+ban_user_id = []
+
+# 过滤设置
+[filters]
+# 是否忽略机器人自身消息
+ignore_self_message = true
+# 内容去重 TTL（秒），防止 AI 回复回流
+content_dedupe_ttl_sec = 120
+# 是否启用正则过滤
+regex_filter_enabled = false
+# 正则过滤模式
+regex_filter_mode = "blacklist"
+# 正则过滤模式列表
+regex_filter_patterns = []

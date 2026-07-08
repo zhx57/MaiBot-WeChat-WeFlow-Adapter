@@ -1,0 +1,281 @@
+"""微信图片下载与视觉模型描述（aiohttp 异步）。
+
+对应 spec「图片识别与转发」：
+- ``download_wechat_image`` —— 从 WeFlow REST API 取图并落盘
+- ``caption_image`` —— 调 ollama / openai 兼容视觉模型生成描述
+- ``image_to_base64`` / ``sha256_of_file`` —— 构造 image Seg 所需的旁路字段
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import logging
+import time
+from pathlib import Path
+from typing import Optional
+
+import aiohttp
+
+from .constants import MESSAGES_API_PATH
+
+log = logging.getLogger(__name__)
+
+# Content-Type → 扩展名映射
+_CONTENT_TYPE_EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+# 描述失败时的占位符
+_CAPTION_FALLBACK = "（图片内容无法描述）"
+
+
+async def download_wechat_image(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    access_token: str,
+    session_id: str,
+    save_dir: Path,
+) -> Optional[Path]:
+    """从 WeFlow REST API 获取最新图片并保存到本地。
+
+    GET ``{base_url}{MESSAGES_API_PATH}?access_token={token}&talker={session_id}&media=true&limit=3``，
+    解析返回 JSON 列表，找 ``mediaType=='image'`` 的项，拼接 ``mediaUrl + access_token`` 下载，
+    按 Content-Type 选扩展名保存到 ``save_dir/wechat_{int(time.time()*1000)}.{ext}``。
+    失败返回 None。``save_dir`` 不存在时自动创建。
+    """
+
+    base = base_url.rstrip("/")
+    url = (
+        f"{base}{MESSAGES_API_PATH}"
+        f"?access_token={access_token}&talker={session_id}&media=true&limit=3"
+    )
+
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                log.error("WeFlow 消息API: HTTP %s", resp.status)
+                return None
+            payload = await resp.json()
+    except Exception as e:
+        log.error("WeFlow 消息API 请求异常：%s", e)
+        return None
+
+    # 防御性解析：可能是 list 或 {"messages":[...]} / {"data":[...]}
+    if isinstance(payload, list):
+        messages = payload
+    elif isinstance(payload, dict):
+        messages = payload.get("messages")
+        if messages is None:
+            messages = payload.get("data", [])
+        if not isinstance(messages, list):
+            messages = []
+    else:
+        messages = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("mediaType") != "image":
+            continue
+        media_url = msg.get("mediaUrl")
+        if not media_url:
+            continue
+
+        sep = "&" if "?" in media_url else "?"
+        dl_url = f"{media_url}{sep}access_token={access_token}"
+
+        try:
+            async with session.get(dl_url) as img_resp:
+                if img_resp.status != 200:
+                    log.warning("微信图片下载失败：HTTP %s", img_resp.status)
+                    continue
+                content_type = img_resp.headers.get("Content-Type", "")
+                image_bytes = await img_resp.read()
+        except Exception as e:
+            log.warning("微信图片下载异常：%s", e)
+            continue
+
+        ext = _ext_for_content_type(content_type)
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = save_dir / f"wechat_{int(time.time() * 1000)}{ext}"
+            save_path.write_bytes(image_bytes)
+            log.info("微信图片已保存：%s", save_path)
+            return save_path
+        except Exception as e:
+            log.error("微信图片落盘失败：%s", e)
+            return None
+
+    log.warning("消息列表无图片 mediaUrl (talker=%s)", session_id)
+    return None
+
+
+def _ext_for_content_type(content_type: str) -> str:
+    """按 Content-Type 选扩展名，默认 .jpg。"""
+
+    ct = (content_type or "").split(";")[0].strip().lower()
+    return _CONTENT_TYPE_EXT.get(ct, ".jpg")
+
+
+async def caption_image(
+    session: aiohttp.ClientSession,
+    image_path: Path,
+    provider: str,
+    model: str,
+    api_key: str,
+    api_base: str,
+    prompt: str,
+    ollama_base_url: str,
+    ollama_timeout: int,
+) -> str:
+    """对图片生成文字描述。
+
+    - ``provider=='ollama'``：POST ``{ollama_base_url}/api/generate``，取 ``response['response']``
+    - ``provider=='openai'``：POST ``{api_base}/chat/completions``，取 ``choices[0].message.content``
+    - ``provider=='none'`` 或失败：返回占位符 ``（图片内容无法描述）``，不抛异常
+    """
+
+    provider = (provider or "none").lower()
+    if provider == "none":
+        return _CAPTION_FALLBACK
+
+    try:
+        img_b64 = image_to_base64(image_path)
+    except Exception as e:
+        log.warning("图片读取失败（%s）：%s", image_path, e)
+        return _CAPTION_FALLBACK
+
+    if provider == "ollama":
+        caption = await _caption_via_ollama(
+            session, img_b64, model, prompt, ollama_base_url, ollama_timeout
+        )
+        return caption or _CAPTION_FALLBACK
+
+    if provider == "openai":
+        caption = await _caption_via_openai(
+            session, img_b64, model, api_key, api_base, prompt, ollama_timeout
+        )
+        return caption or _CAPTION_FALLBACK
+
+    # 未知 provider
+    log.warning("未知 image_caption provider：%s", provider)
+    return _CAPTION_FALLBACK
+
+
+async def _caption_via_ollama(
+    session: aiohttp.ClientSession,
+    img_b64: str,
+    model: str,
+    prompt: str,
+    ollama_base_url: str,
+    timeout: int,
+) -> Optional[str]:
+    """ollama 原生 /api/generate 视觉描述。"""
+
+    url = f"{ollama_base_url.rstrip('/')}/api/generate"
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "images": [img_b64],
+        "stream": False,
+    }
+    try:
+        async with session.post(
+            url, json=body, timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                log.warning("ollama 返回 HTTP %s：%s", resp.status, text[:200])
+                return None
+            data = await resp.json()
+            caption = str(data.get("response", "")).strip()
+            if caption:
+                log.info("图片描述（ollama）：%s", caption[:80])
+            return caption or None
+    except asyncio.TimeoutError:
+        log.warning("ollama 图片描述超时（%ss）", timeout)
+        return None
+    except Exception as e:
+        log.warning("ollama 图片描述失败：%s", e)
+        return None
+
+
+async def _caption_via_openai(
+    session: aiohttp.ClientSession,
+    img_b64: str,
+    model: str,
+    api_key: str,
+    api_base: str,
+    prompt: str,
+    timeout: int,
+) -> Optional[str]:
+    """OpenAI 兼容 /chat/completions 视觉描述。"""
+
+    url = f"{api_base.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 300,
+    }
+    try:
+        async with session.post(
+            url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                log.warning("openai 兼容 API 返回 HTTP %s：%s", resp.status, text[:200])
+                return None
+            data = await resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                return None
+            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            caption = str(message.get("content", "")).strip()
+            if caption:
+                log.info("图片描述（openai）：%s", caption[:80])
+            return caption or None
+    except asyncio.TimeoutError:
+        log.warning("openai 兼容图片描述超时（%ss）", timeout)
+        return None
+    except Exception as e:
+        log.warning("openai 兼容图片描述失败：%s", e)
+        return None
+
+
+def image_to_base64(path: Path) -> str:
+    """读文件返回 base64 字符串。"""
+
+    data = Path(path).read_bytes()
+    return base64.b64encode(data).decode("utf-8")
+
+
+def sha256_of_file(path: Path) -> str:
+    """返回文件内容的 sha256 十六进制。"""
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        # 分块读取，避免大图一次性占用内存
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
