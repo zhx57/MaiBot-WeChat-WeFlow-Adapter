@@ -13,7 +13,7 @@
 - **WeFlow SSE 入站**：自动重连、401 检测、`message.new` / `message.revoke` 事件过滤。
 - **消息缓冲合并**：群聊按 `buffer_seconds` 合并多条连续消息，避免 AI 被频繁打断。
 - **三种群回复模式**：`mention`（仅 @ 回复）/ `all`（全部回复）/ `batch`（整群批处理）。
-- **图片描述**：支持 `ollama` / `openai`（兼容接口）视觉模型，自动为图片生成中文描述。
+- **图片描述**：支持 `maibot`（复用 Host 已配置模型，推荐）/ `ollama` / `openai`（兼容接口）视觉模型，自动为图片生成中文描述。
 - **图片转发**：可选下载图片并以 `image` 消息段（base64 + sha256）转发给 MaiBot。
 - **双发送器**：`uia`（Windows UI 自动化，默认）/ `weflow_api`（WeFlow REST API，需第三方扩展支持）。
 - **稳定 ID 映射**：md5 确定性 ID + 持久化 `id_contact_map.json`，重启后出站反查不丢失。
@@ -86,8 +86,8 @@ reconnect_delay_sec = 10
 history_filter_enabled = true
 
 [image_caption]
-provider = "none"             # none / ollama / openai
-model = "llava:7b"
+provider = "none"             # none / maibot（复用 Host 模型，推荐）/ ollama / openai
+model = "llava:7b"            # maibot 时留空用 Host 默认
 api_key = ""
 api_base = "https://api.moonshot.cn/v1"
 prompt = "请用中文简短描述这张图片的内容"
@@ -122,7 +122,7 @@ regex_filter_patterns = []
 | `bot.nicknames` | 机器人微信昵称列表，用于群聊 `@` 检测与自回复过滤 |
 | `bot.wxid` | 机器人自身 wxid，作为 `self_id` 上报网关，并参与自回复过滤 |
 | `bridge.group_reply_mode` | `mention`=仅被 @ 时回复；`all`=群内所有消息都回复；`batch`=整群合并为一条批处理消息 |
-| `image_caption.provider` | `none`=不描述仅转发图片；`ollama`=本地 Ollama 视觉模型；`openai`=OpenAI 兼容接口 |
+| `image_caption.provider` | `none`=不描述仅转发图片；`maibot`=复用 Host 已配置模型（推荐，无需重复填 api_key）；`ollama`=本地 Ollama 视觉模型；`openai`=OpenAI 兼容接口 |
 | `chat.group_list_type` | `whitelist`=仅响应 `group_list` 中的群；`blacklist`=屏蔽 `group_list` 中的群 |
 
 ## 架构

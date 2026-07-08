@@ -413,6 +413,7 @@ class WeChatBridge:
                     self._config.image_caption.prompt,
                     self._config.image_caption.ollama_base_url,
                     self._config.image_caption.ollama_timeout,
+                    llm=self._ctx.llm,
                 )
                 injected_raw_message.append(
                     {"type": "text", "data": f"[图片: {caption}]"}

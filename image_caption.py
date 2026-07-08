@@ -2,7 +2,7 @@
 
 对应 spec「图片识别与转发」：
 - ``download_wechat_image`` —— 从 WeFlow REST API 取图并落盘
-- ``caption_image`` —— 调 ollama / openai 兼容视觉模型生成描述
+- ``caption_image`` —— 调 maibot / ollama / openai 视觉模型生成描述
 - ``image_to_base64`` / ``sha256_of_file`` —— 构造 image Seg 所需的旁路字段
 """
 
@@ -14,7 +14,7 @@ import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 
@@ -133,9 +133,13 @@ async def caption_image(
     prompt: str,
     ollama_base_url: str,
     ollama_timeout: int,
+    llm: Optional[Any] = None,
 ) -> str:
     """对图片生成文字描述。
 
+    - ``provider=='maibot'``：复用 MaiBot Host 已配置的视觉模型，调 ``llm.generate()``
+      传 OpenAI vision 消息列表格式（``image_url`` 内联 base64）。``model`` 留空用 Host 默认。
+      需传入 ``llm``（即 ``ctx.llm``）。
     - ``provider=='ollama'``：POST ``{ollama_base_url}/api/generate``，取 ``response['response']``
     - ``provider=='openai'``：POST ``{api_base}/chat/completions``，取 ``choices[0].message.content``
     - ``provider=='none'`` 或失败：返回占位符 ``（图片内容无法描述）``，不抛异常
@@ -150,6 +154,15 @@ async def caption_image(
     except Exception as e:
         log.warning("图片读取失败（%s）：%s", image_path, e)
         return _CAPTION_FALLBACK
+
+    if provider == "maibot":
+        if llm is None:
+            log.warning("provider=maibot 但未传入 ctx.llm，无法描述图片")
+            return _CAPTION_FALLBACK
+        caption = await _caption_via_maibot(
+            llm, img_b64, model, prompt, ollama_timeout
+        )
+        return caption or _CAPTION_FALLBACK
 
     if provider == "ollama":
         caption = await _caption_via_ollama(
@@ -166,6 +179,54 @@ async def caption_image(
     # 未知 provider
     log.warning("未知 image_caption provider：%s", provider)
     return _CAPTION_FALLBACK
+
+
+async def _caption_via_maibot(
+    llm: Any,
+    img_b64: str,
+    model: str,
+    prompt: str,
+    timeout: int,
+) -> Optional[str]:
+    """通过 MaiBot Host 的 ``ctx.llm.generate()`` 调用已配置视觉模型。
+
+    复用 Host 在「模型配置」页配置的 api_providers / 模型任务，无需在插件重复填写
+    api_key/api_base。``model`` 留空时使用 Host 默认模型。消息采用 OpenAI vision
+    兼容格式（``content`` 列表含 ``text`` 与 ``image_url`` 段）。
+    """
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                },
+            ],
+        }
+    ]
+    try:
+        result = await asyncio.wait_for(
+            llm.generate(prompt=messages, model=model or ""),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        log.warning("maibot 图片描述超时（%ss）", timeout)
+        return None
+    except Exception as e:
+        log.warning("maibot 图片描述失败：%s", e)
+        return None
+
+    if not isinstance(result, dict) or not result.get("success"):
+        log.warning("maibot 图片描述返回失败：%s", result)
+        return None
+    caption = str(result.get("response", "")).strip()
+    if caption:
+        used = result.get("model", "") or "host-default"
+        log.info("图片描述（maibot/%s）：%s", used, caption[:80])
+    return caption or None
 
 
 async def _caption_via_ollama(

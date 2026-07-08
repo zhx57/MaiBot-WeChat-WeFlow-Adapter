@@ -96,10 +96,16 @@ class ImageCaptionSection(PluginConfigBase):
     __ui_icon__ = "image"
     __ui_order__ = 4
 
-    provider: Literal["none", "ollama", "openai"] = Field(
-        default="none", description="图片描述服务：none=不描述（仅转发图片），ollama，openai"
+    provider: Literal["none", "maibot", "ollama", "openai"] = Field(
+        default="none",
+        description="图片描述服务：none=不描述（仅转发图片）；maibot=复用 MaiBot Host "
+        "已配置的视觉模型（推荐，无需重复填 api_key）；ollama=本地 Ollama；openai=OpenAI 兼容",
     )
-    model: str = Field(default=DEFAULT_IMAGE_CAPTION_MODEL, description="视觉模型名，如 llava:7b")
+    model: str = Field(
+        default=DEFAULT_IMAGE_CAPTION_MODEL,
+        description="视觉模型名。provider=maibot 时留空则用 Host 默认模型；"
+        "ollama 填如 llava:7b；openai 填如 gpt-4o",
+    )
     api_key: str = Field(
         default="",
         description="OpenAI 兼容模式 API Key",

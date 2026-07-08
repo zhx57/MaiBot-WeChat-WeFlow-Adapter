@@ -42,9 +42,10 @@ history_filter_enabled = true
 
 # 图片描述设置
 [image_caption]
-# 图片描述服务：none=不描述（仅转发图片），ollama，openai
+# 图片描述服务：none=不描述（仅转发图片）；maibot=复用 MaiBot Host 已配置模型（推荐）；
+#              ollama=本地 Ollama；openai=OpenAI 兼容
 provider = "none"
-# 视觉模型名，如 llava:7b
+# 视觉模型名。provider=maibot 时留空用 Host 默认；ollama 如 llava:7b；openai 如 gpt-4o
 model = "llava:7b"
 # OpenAI 兼容模式 API Key
 api_key = ""
