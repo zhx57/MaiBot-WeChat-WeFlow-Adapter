@@ -11,6 +11,30 @@ from config import MAIBOT_API_URL, PLATFORM_ID
 from maim_message import Router, RouteConfig, TargetConfig, MessageBase, BaseMessageInfo, UserInfo, GroupInfo, Seg
 import os # Added for file existence check
 
+
+class _SendOnlyChatWnd:
+    """轻量版 ChatWnd，仅供发送消息，跳过 GetAllMessage()。
+
+    原版 wxauto.elements.ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录，
+    UIA 遍历极慢(10s+)。发送消息只用 editbox，根本不需要消息历史。
+    这里只初始化发送所需的最小属性集，把首次发送从 ~10s 压到 ~1s。
+    复用 wxauto.elements.ChatWnd 的 _show / SendMsg 实现（动态绑定）。
+    """
+
+    def __init__(self, who, language='cn'):
+        from wxauto import uiautomation as uia
+        from wxauto.elements import ChatWnd
+        self.who = who
+        self.language = language
+        self.usedmsgid = []  # GetNewMessage 用，发送不需要，留空避免属性错误
+        self.savepic = False
+        self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who)
+        self.editbox = self.UiaAPI.EditControl()
+        # 复用 ChatWnd 的 _show / SendMsg 方法实现
+        self._show = ChatWnd._show.__get__(self, ChatWnd)
+        self.SendMsg = ChatWnd.SendMsg.__get__(self, ChatWnd)
+
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -256,14 +280,12 @@ class MessageProcessor:
             return False
 
     def _send_text_cached(self, wechat, receiver, content):
-        """通过缓存的 ChatWnd 实例发送文字消息。
+        """通过缓存的轻量 ChatWnd 实例发送文字消息。
 
-        wxauto 的 WeChat.SendMsg 每次都新建 ChatWnd(receiver)，
-        而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
-        缓存后只有第一次发送需要读全部记录，后续发送复用实例。
+        用 _SendOnlyChatWnd（跳过 GetAllMessage）替代原版 ChatWnd，
+        首次发送从 ~10s 压到 ~1s。缓存后后续发送复用实例，更快。
         对没有独立聊天窗口的新对象，会先弹出独立窗口。
         """
-        from wxauto.elements import ChatWnd
         from wxauto.utils import FindWindow
 
         # 1) 确保独立聊天窗口存在
@@ -274,8 +296,8 @@ class MessageProcessor:
         # 2) 获取/创建缓存的 ChatWnd 实例
         chatwnd = self._chatwnd_cache.get(receiver)
         if chatwnd is None:
-            logger.info(f"首次发送到 {receiver!r}，创建 ChatWnd 实例（需读取聊天记录，稍慢）")
-            chatwnd = ChatWnd(receiver, wechat.language)
+            logger.info(f"首次发送到 {receiver!r}，创建轻量 ChatWnd 实例")
+            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
             self._chatwnd_cache[receiver] = chatwnd
 
         # 3) 发送，失败则重建一次
@@ -287,7 +309,7 @@ class MessageProcessor:
             if not self._ensure_chatwnd(wechat, receiver):
                 logger.error(f"重试失败：{receiver!r} 的独立聊天窗口已不存在")
                 return
-            chatwnd = ChatWnd(receiver, wechat.language)
+            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
             self._chatwnd_cache[receiver] = chatwnd
             chatwnd.SendMsg(content)
 
