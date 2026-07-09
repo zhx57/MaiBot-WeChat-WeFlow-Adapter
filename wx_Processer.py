@@ -254,7 +254,17 @@ class MessageProcessor:
                     if wechat is None:
                         raise RuntimeError("全局 wxauto.WeChat 实例未初始化")
 
-                    logger.info(f"开始发送到微信: receiver={receiver}, content={str(content)[:80]}")
+                    # 诊断：打印 receiver 的确切值和类型，排查名字对不上的问题
+                    logger.info(f"开始发送到微信: receiver={receiver!r} (type={type(receiver).__name__}), content={str(content)[:80]}")
+
+                    # 前置检查：尝试切换到目标聊天，单独执行并打日志
+                    # 如果 ChatWith 失败，后面的 SendMsg 不会执行（解释了剪贴板为空）
+                    try:
+                        wechat.ChatWith(receiver)
+                        logger.info(f"✅ 已切换到聊天: {receiver!r}")
+                    except Exception as chat_err:
+                        logger.error(f"❌ 切换聊天失败 (receiver={receiver!r}): {chat_err}")
+                        raise
 
                     # 检查是否是base64编码的图片数据
                     if isinstance(content, str) and (content.startswith('data:image/') or len(content) > 1000 and content.replace('+', '').replace('/', '').replace('=', '').isalnum()):
