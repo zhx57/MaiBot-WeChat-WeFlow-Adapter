@@ -26,7 +26,7 @@ class MessageProcessor:
     def __init__(self, platform=PLATFORM_ID):
         """
         初始化消息处理器
-        
+
         Args:
             platform (str): 消息平台标识，默认使用配置文件中的PLATFORM_ID
         """
@@ -36,8 +36,13 @@ class MessageProcessor:
         # 消息发送队列，确保按顺序发送
         self.send_queue = None  # 将在start_router中初始化
         self.send_task = None
+        # md5哈希 → 可读名称 的映射表
+        # 入站时把 md5(sender)/md5(group_name) → 原始名称 记下来，
+        # 出站时麦麦回复的 receiver_info 里只有 md5 哈希没有可读昵称，
+        # 用这个表反查出 wxauto 需要的群名/昵称。
+        self._id_to_name = {}
         logger.info(f"消息处理器初始化成功，平台：{platform}")
-        
+
         # 初始化Router
         self._init_router()
     
@@ -129,19 +134,11 @@ class MessageProcessor:
             logger.info(f"收到来自MaiBot的回复 [消息ID: {message_id}]: {message_segment}")
             logger.info(f"消息内容预览: {content_preview}")
             
-            # 提取回复信息
-            
-            # 获取接收者信息
-            user_info = message_info.user_info
-            group_info = message_info.group_info
-            
-            # 确定接收者
-            if group_info and group_info.group_name:
-                receiver = group_info.group_name
-            elif user_info and user_info.user_nickname:
-                receiver = user_info.user_nickname
-            else:
-                logger.error("无法确定回复接收者")
+            # 提取回复信息：确定接收者
+            receiver = self._resolve_receiver(message_info)
+            if not receiver:
+                logger.error("无法确定回复接收者。_id_to_name 条数=%d, message_info=%s",
+                             len(self._id_to_name), message_info)
                 return
             
             # 处理消息段
@@ -152,7 +149,79 @@ class MessageProcessor:
             # 添加更详细的错误信息
             import traceback
             logger.error(f"错误详情: {traceback.format_exc()}")
-    
+
+    def _bot_self_nickname(self):
+        """返回机器人自己的微信昵称，用于排除把机器人自己当接收者的情况。
+        优先取 .env 里 WX_BOT_NICKNAME，其次回退到 PLATFORM_ID 之外的常见默认值。"""
+        nick = os.environ.get('WX_BOT_NICKNAME', '').strip()
+        if nick:
+            return nick
+        return None
+
+    def _resolve_receiver(self, message_info):
+        """从 MaiBot 回复的 message_info 中确定 wxauto 需要的接收者（群名或私聊昵称）。
+
+        新版麦麦用 sender_info/receiver_info 区分发送方和接收方：
+        - sender_info.user_info 是机器人自己
+        - receiver_info.user_info / receiver_info.group_info 才是真正要回复的对象
+        老版麦麦用 user_info/group_info（user_info 是发送方，回复时即接收方）。
+
+        麦麦回复的 receiver_info 里通常只有 md5 哈希的 user_id/group_id，
+        没有可读昵称，需要用入站时记录的 _id_to_name 反查。
+        """
+        if message_info is None:
+            return None
+
+        receiver = None
+
+        # 1) 优先用新版字段 receiver_info
+        receiver_info = getattr(message_info, 'receiver_info', None)
+        if receiver_info:
+            r_group = getattr(receiver_info, 'group_info', None)
+            if r_group:
+                gname = getattr(r_group, 'group_name', None)
+                gid = getattr(r_group, 'group_id', None)
+                if gname:
+                    receiver = gname
+                elif gid and gid in self._id_to_name:
+                    receiver = self._id_to_name[gid]
+                    logger.info(f"通过 receiver_info.group_id={gid} 反查到群名: {receiver}")
+            if not receiver:
+                r_user = getattr(receiver_info, 'user_info', None)
+                if r_user:
+                    uname = getattr(r_user, 'user_nickname', None)
+                    uid = getattr(r_user, 'user_id', None)
+                    if uname and str(uname).strip():
+                        receiver = uname
+                    elif uid and uid in self._id_to_name:
+                        receiver = self._id_to_name[uid]
+                        logger.info(f"通过 receiver_info.user_id={uid} 反查到昵称: {receiver}")
+
+        # 2) 回退到老版字段 group_info / user_info
+        # 注意：老版 user_info.user_nickname 在回复里可能是机器人自己（如 '麦麦'），要排除
+        if not receiver:
+            group_info = getattr(message_info, 'group_info', None)
+            if group_info:
+                gname = getattr(group_info, 'group_name', None)
+                if gname:
+                    receiver = gname
+        if not receiver:
+            user_info = getattr(message_info, 'user_info', None)
+            if user_info:
+                uname = getattr(user_info, 'user_nickname', None)
+                uid = getattr(user_info, 'user_id', None)
+                if uname and str(uname).strip():
+                    bot_nick = self._bot_self_nickname()
+                    if bot_nick and str(uname).strip() == bot_nick:
+                        logger.warning(f"user_info.user_nickname='{uname}' 是机器人自己，不作为接收者")
+                    else:
+                        receiver = uname
+                elif uid and uid in self._id_to_name:
+                    receiver = self._id_to_name[uid]
+                    logger.info(f"通过 user_info.user_id={uid} 反查到昵称: {receiver}")
+
+        return receiver
+
     async def _process_message_segments(self, message_segment, receiver):
         """递归处理消息段，支持多段消息"""
         try:
@@ -423,6 +492,10 @@ class MessageProcessor:
         
         # 使用 MD5 哈希生成用户ID和群组ID
         user_id_hash = hashlib.md5(sender.encode('utf-8')).hexdigest()
+
+        # 记录 md5 → 可读昵称 映射，出站时麦麦回复的 receiver_info
+        # 里只有 md5 哈希没有可读昵称，需要用这个反查
+        self._id_to_name[user_id_hash] = sender
         
         # 构建基本消息信息
         message_info = {
@@ -446,7 +519,10 @@ class MessageProcessor:
         if is_group_chat:
             # 使用 MD5 哈希生成群组ID
             group_id_hash = hashlib.md5(chat_name.encode('utf-8')).hexdigest()
-            
+
+            # 记录群组 md5 → 可读群名 映射
+            self._id_to_name[group_id_hash] = chat_name
+
             message_info["group_info"] = {
                 "platform": self.platform,
                 "group_id": group_id_hash,  # 使用哈希后的群组ID
