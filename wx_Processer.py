@@ -226,38 +226,66 @@ class MessageProcessor:
 
         return receiver
 
+    def _ensure_chatwnd(self, wechat, receiver):
+        """确保 receiver 有独立聊天窗口(ChatWnd)并返回 FindWindow 句柄。
+
+        这个 wxauto 版本的 SendMsg/ChatWnd 只能对「独立弹出的聊天窗口」操作，
+        主窗口里的聊天标签页发不了消息。没有独立窗口时，需要：
+        1. ChatWith 切到主窗口该聊天
+        2. 双击会话列表项弹出独立窗口
+        （参考 wxauto.AddListenChat 的实现）
+        返回 True 表示独立窗口已就绪，False 表示无法弹出。
+        """
+        from wxauto.utils import FindWindow
+        if FindWindow(name=receiver, classname='ChatWnd'):
+            return True
+        try:
+            logger.info(f"{receiver!r} 无独立聊天窗口，尝试弹出独立窗口")
+            wechat.ChatWith(receiver)
+            wechat.SessionBox.ListItemControl(RegexName=receiver).DoubleClick(simulateMove=False)
+            import time
+            time.sleep(1)  # 等待独立窗口创建
+            ok = FindWindow(name=receiver, classname='ChatWnd')
+            if ok:
+                logger.info(f"✅ 已弹出 {receiver!r} 的独立聊天窗口")
+                return True
+            logger.error(f"❌ 弹出 {receiver!r} 独立窗口失败")
+            return False
+        except Exception as e:
+            logger.error(f"❌ 弹出 {receiver!r} 独立窗口异常: {e}")
+            return False
+
     def _send_text_cached(self, wechat, receiver, content):
         """通过缓存的 ChatWnd 实例发送文字消息。
 
         wxauto 的 WeChat.SendMsg 每次都新建 ChatWnd(receiver)，
         而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
         缓存后只有第一次发送需要读全部记录，后续发送复用实例。
+        对没有独立聊天窗口的新对象，会先弹出独立窗口。
         """
         from wxauto.elements import ChatWnd
         from wxauto.utils import FindWindow
 
-        # 检查独立聊天窗口(ChatWnd)是否存在
-        if not FindWindow(name=receiver, classname='ChatWnd'):
-            # 没有独立聊天窗口，回退到 wechat.SendMsg
-            logger.warning(f"未找到 {receiver!r} 的独立聊天窗口(ChatWnd)，回退到 wechat.SendMsg")
-            wechat.SendMsg(content, receiver)
+        # 1) 确保独立聊天窗口存在
+        if not self._ensure_chatwnd(wechat, receiver):
+            logger.error(f"{receiver!r} 无法建立独立聊天窗口，发送失败")
             return
 
+        # 2) 获取/创建缓存的 ChatWnd 实例
         chatwnd = self._chatwnd_cache.get(receiver)
         if chatwnd is None:
             logger.info(f"首次发送到 {receiver!r}，创建 ChatWnd 实例（需读取聊天记录，稍慢）")
             chatwnd = ChatWnd(receiver, wechat.language)
             self._chatwnd_cache[receiver] = chatwnd
 
+        # 3) 发送，失败则重建一次
         try:
             chatwnd.SendMsg(content)
         except Exception as e:
-            # 窗口可能已关闭，清除缓存并重试一次
             logger.warning(f"缓存的 ChatWnd 发送失败({e})，清除缓存重试")
             self._chatwnd_cache.pop(receiver, None)
-            if not FindWindow(name=receiver, classname='ChatWnd'):
+            if not self._ensure_chatwnd(wechat, receiver):
                 logger.error(f"重试失败：{receiver!r} 的独立聊天窗口已不存在")
-                wechat.SendMsg(content, receiver)
                 return
             chatwnd = ChatWnd(receiver, wechat.language)
             self._chatwnd_cache[receiver] = chatwnd
@@ -416,7 +444,7 @@ class MessageProcessor:
                             logger.error(f"处理base64图片失败: {str(e)}")
                             # 如果base64解码失败，尝试作为文字发送
                             logger.info(f"base64解码失败，改发文字: {receiver}")
-                            wechat.SendMsg(content, receiver)
+                            self._send_text_cached(wechat, receiver, content)
                             logger.info(f"已发送文字内容: {receiver} - {content[:50]}...")
 
                     # 检查是否是图片/表情包路径
@@ -429,7 +457,7 @@ class MessageProcessor:
                         else:
                             # 如果文件不存在，尝试发送文字内容
                             logger.info(f"图片文件不存在，改发文字: {receiver}")
-                            wechat.SendMsg(content, receiver)
+                            self._send_text_cached(wechat, receiver, content)
                             logger.info(f"已发送文字内容: {receiver} - {content}")
                     else:
                         # 普通文字消息
