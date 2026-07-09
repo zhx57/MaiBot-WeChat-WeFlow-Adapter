@@ -71,7 +71,12 @@ class WeChatListener:
 
         # 开始监听循环
         wechat_lost = False  # 标记微信窗口是否丢失
+        lost_since = None    # 窗口丢失的开始时间
+        reconnect_fail_count = 0  # 重连连续失败次数
         last_alive_check = 0
+        last_lost_log = 0    # 上次打印"仍在等待"的时间
+        MAX_RECONNECT_FAILS = 5     # 重连连续失败上限，超过则抛异常触发整体重启
+        MAX_LOST_DURATION = 600     # 窗口丢失最长等待时间(秒)，超过则放弃(10分钟)
         try:
             while self.running:
                 # 每5秒检测一次微信窗口是否还在（避免每秒都 FindWindow 开销）
@@ -82,6 +87,20 @@ class WeChatListener:
                         if not wechat_lost:
                             logger.warning("⚠️ 微信主窗口已关闭，等待重新打开...")
                             wechat_lost = True
+                            lost_since = now
+                            reconnect_fail_count = 0
+                        else:
+                            # 检查是否超过最大等待时间
+                            elapsed = now - lost_since
+                            if elapsed > MAX_LOST_DURATION:
+                                logger.error(f"❌ 微信窗口已关闭超过{int(elapsed)}秒（上限{MAX_LOST_DURATION}秒），"
+                                             f"放弃等待，触发整体重启")
+                                raise RuntimeError(f"微信窗口丢失超过{MAX_LOST_DURATION}秒")
+                            # 每30秒提示一次还在等待，避免日志刷屏
+                            if now - last_lost_log > 30:
+                                last_lost_log = now
+                                logger.warning(f"⚠️ 微信窗口仍关闭，已等待{int(elapsed)}秒"
+                                               f"（最长等待{MAX_LOST_DURATION}秒）...")
                         time.sleep(3)  # 窗口丢失时降低轮询频率
                         continue
                     elif wechat_lost:
@@ -89,8 +108,15 @@ class WeChatListener:
                         logger.info("✅ 检测到微信窗口恢复")
                         if self._reconnect_wechat():
                             wechat_lost = False
+                            reconnect_fail_count = 0
                             self._failed_chats.clear()  # 重连成功，清空失败列表
                         else:
+                            reconnect_fail_count += 1
+                            if reconnect_fail_count >= MAX_RECONNECT_FAILS:
+                                logger.error(f"❌ 微信重连连续失败{reconnect_fail_count}次"
+                                             f"（上限{MAX_RECONNECT_FAILS}次），触发整体重启")
+                                raise RuntimeError(f"微信重连连续失败{MAX_RECONNECT_FAILS}次")
+                            logger.warning(f"重连失败（第{reconnect_fail_count}/{MAX_RECONNECT_FAILS}次），稍后重试")
                             time.sleep(3)
                             continue
 
@@ -104,6 +130,7 @@ class WeChatListener:
             logger.info("监听被用户中断")
         except Exception as e:
             logger.error(f"监听过程中发生错误: {str(e)}")
+            raise  # 重新抛出，让 main.py 的重启逻辑接管
         finally:
             self.stop_listening()
 
