@@ -70,11 +70,35 @@ class WeChatListener:
                         + (f"，失败 {fail} 将在运行中重试" if fail else ""))
 
         # 开始监听循环
+        wechat_lost = False  # 标记微信窗口是否丢失
+        last_alive_check = 0
         try:
             while self.running:
-                self._check_new_messages()
-                # 定期重试失败的聊天（每30秒）
-                self._retry_failed_chats()
+                # 每5秒检测一次微信窗口是否还在（避免每秒都 FindWindow 开销）
+                now = time.time()
+                if now - last_alive_check > 5:
+                    last_alive_check = now
+                    if not self._is_wechat_alive():
+                        if not wechat_lost:
+                            logger.warning("⚠️ 微信主窗口已关闭，等待重新打开...")
+                            wechat_lost = True
+                        time.sleep(3)  # 窗口丢失时降低轮询频率
+                        continue
+                    elif wechat_lost:
+                        # 窗口恢复了，重新初始化监听
+                        logger.info("✅ 检测到微信窗口恢复")
+                        if self._reconnect_wechat():
+                            wechat_lost = False
+                            self._failed_chats.clear()  # 重连成功，清空失败列表
+                        else:
+                            time.sleep(3)
+                            continue
+
+                # 微信窗口正常时才检查消息
+                if not wechat_lost:
+                    self._check_new_messages()
+                    # 定期重试失败的聊天（每30秒）
+                    self._retry_failed_chats()
                 time.sleep(1)  # 每秒检查一次新消息
         except KeyboardInterrupt:
             logger.info("监听被用户中断")
@@ -105,18 +129,37 @@ class WeChatListener:
         if self._failed_chats:
             logger.warning(f"仍有 {len(self._failed_chats)} 个聊天监听失败: {list(self._failed_chats)}")
 
+    def _clear_search_box(self):
+        """清空微信主窗口的搜索框。
+
+        ChatWith 内部用 Ctrl+F 打开搜索框后 SendKeys 输入搜索词，
+        但不会清空已有内容。如果上次 ChatWith 中途被打断（搜索词没被消费），
+        下次重试会在搜索框里追加，导致 '元宝原宝元宝原宝' 搜不到结果。
+        重试前先 Esc 关闭搜索框 + 确保干净。
+        """
+        try:
+            # Esc 关闭搜索框（如果开着的话）
+            self.wx.UiaAPI.SendKeys('{Esc}', waitTime=0.3)
+        except Exception:
+            pass
+
     def _add_listen_chat(self, chat_name, max_retries=3):
         """添加监听的聊天对象，带重试。
 
         启动时 WeChat 窗口可能还没完全就绪，或 ChatWith 切换中途被打断，
         单次失败不放弃，重试 max_retries 次，每次间隔递增（1s/2s/3s）。
         成功则加入 self.listen_chats，失败则加入 self._failed_chats 待主循环重试。
+        每次重试前清空搜索框，避免搜索词重复累积。
         """
         import os
         savepic = os.getenv('IMAGE_AUTO_DOWNLOAD', 'true').lower() == 'true'
 
         for attempt in range(1, max_retries + 1):
             try:
+                # 重试前清空搜索框，避免上次残留的搜索词和本次叠加
+                # （首次也清一下，防止上次运行残留）
+                self._clear_search_box()
+
                 # 尝试打开聊天窗口
                 chat_result = self.wx.ChatWith(chat_name)
                 if chat_result:
@@ -148,18 +191,69 @@ class WeChatListener:
         try:
             # 获取所有监听聊天的新消息
             all_messages = self.wx.GetListenMessage()
-            
+
             if all_messages:
                 for chat, messages in all_messages.items():
                     chat_name = chat.who
                     if messages:
                         logger.info(f"收到来自 {chat_name} 的 {len(messages)} 条新消息")
-                        
+
                         # 处理每条消息
                         for msg in messages:
                             self._process_message(chat_name, msg)
         except Exception as e:
             logger.error(f"检查新消息时发生错误: {str(e)}")
+
+    def _is_wechat_alive(self):
+        """检测微信主窗口是否还存在。
+
+        wxauto 初始化时缓存了 HWND 和 UIA 控件树，如果用户中途关掉微信窗口，
+        后续所有操作都会失败。用 FindWindow 重新检测主窗口是否还在。
+        """
+        try:
+            from wxauto.utils import FindWindow
+            return bool(FindWindow(classname='WeChatMainWndForPC'))
+        except Exception:
+            return False
+
+    def _reconnect_wechat(self):
+        """微信窗口恢复后重新初始化监听。
+
+        微信窗口被关掉再重新打开后，原 self.wx 的 HWND 和 UIA 控件引用全部失效。
+        这里重新创建 WeChat 实例并重新添加所有监听聊天。
+        """
+        logger.info("检测到微信窗口恢复，重新初始化监听...")
+        try:
+            # 重新创建 WeChat 实例（会重新查找窗口和 UIA 树）
+            self.wx = WeChat()
+            global wx
+            wx = self.wx
+            logger.info(f"微信重新连接成功，登录账号：{self.wx.nickname}")
+
+            # 清空旧的监听列表，重新添加
+            self.listen_chats = {}
+            time.sleep(1)  # 等窗口稳定
+
+            chats_to_restore = list(self.target_chats) if self.target_chats else []
+            if not chats_to_restore:
+                # 没有指定目标聊天时，恢复当前所有会话
+                try:
+                    session_list = self.wx.GetSessionList(reset=True)
+                    chats_to_restore = [c for c in session_list if c not in WX_EXCLUDED_CHATS]
+                except Exception as e:
+                    logger.error(f"恢复会话列表失败: {e}")
+
+            for chat in chats_to_restore:
+                self._add_listen_chat(chat)
+                time.sleep(0.5)
+
+            ok = len(self.listen_chats)
+            total = len(chats_to_restore)
+            logger.info(f"重新初始化完成: 成功 {ok}/{total}")
+            return ok > 0
+        except Exception as e:
+            logger.error(f"重新初始化微信监听失败: {e}")
+            return False
     
     def _process_message(self, chat_name, message):
         """处理单条消息"""
