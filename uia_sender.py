@@ -199,32 +199,18 @@ class UiaSender(BaseSender):
 
             try:
                 if self._use_coord_fallback:
-                    # Qt 界面：点击输入框区域→剪贴板粘贴→Enter
+                    # Qt 界面：找不到 EditControl，靠全局快捷键发送
+                    # 窗口已在 _activate() 里拉到前台，焦点默认在输入框；
+                    # 仅当焦点不在输入框时才点一下输入框区域兜底。
                     import pyperclip
-                    from ctypes import wintypes
-                    hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-                    if not hwnd:
-                        hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
-                    if hwnd:
-                        rect = wintypes.RECT()
-                        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                        win_w = rect.right - rect.left
-                        win_h = rect.bottom - rect.top
-                        # 输入框大致在窗口底部居中偏左的位置
-                        input_x = rect.left + int(win_w * 0.3)
-                        input_y = rect.top + int(win_h * 0.92)
-                        # 物理点击让输入框获得焦点（PostMessage 对 Qt 子控件无效）
-                        ctypes.windll.user32.SetCursorPos(input_x, input_y)
-                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # down
-                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # up
-                    time.sleep(0.3)
+                    self._click_input_area_if_needed()
                     pyperclip.copy(text)
                     time.sleep(0.05)
                     self._auto.SendKeys('{Ctrl}v')
                     time.sleep(0.3)
                     self._auto.SendKeys('{Enter}')
                     self.logger.info(
-                        f"[UIA✓] {display_name}: {text[:50]}... (无鼠标模式)"
+                        f"[UIA✓] {display_name}: {text[:50]}... (快捷键模式)"
                     )
                     return
 
@@ -301,26 +287,14 @@ class UiaSender(BaseSender):
                     raise RuntimeError("UIA 发送器：无法定位输入框")
 
                 if self._use_coord_fallback:
-                    import ctypes
-                    from ctypes import wintypes
-                    hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-                    if not hwnd:
-                        hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
-                    if hwnd:
-                        rect = wintypes.RECT()
-                        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                        input_x = rect.left + int((rect.right - rect.left) * 0.3)
-                        input_y = rect.top + int((rect.bottom - rect.top) * 0.92)
-                        ctypes.windll.user32.SetCursorPos(input_x, input_y)
-                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
-                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-                    time.sleep(0.3)
+                    # Qt 界面：找不到 EditControl，靠全局快捷键发送图片
+                    self._click_input_area_if_needed()
                     self._auto.SendKeys('{Ctrl}v')
                     time.sleep(0.5)
                     self._auto.SendKeys('{Enter}')
                     self.logger.info(
                         f"[UIA✓] 图片 → {display_name}: "
-                        f"{os.path.basename(image_path_str)} (无鼠标模式)"
+                        f"{os.path.basename(image_path_str)} (快捷键模式)"
                     )
                     return
 
@@ -495,6 +469,40 @@ class UiaSender(BaseSender):
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
         time.sleep(0.3)
 
+    def _click_input_area_if_needed(self) -> None:
+        """快捷键模式专用：焦点不在输入框时点一下输入框区域，已在则跳过。
+
+        Qt 界面下找不到 EditControl，但微信窗口被拉到前台后焦点通常
+        已在输入框。通过 ``GetFocus`` 拿到当前焦点控件的类名判断：
+        类名含 ``Edit`` 视为已在输入框，跳过点击；否则用坐标兜底点一下。
+        这样既保证焦点正确，又避免每次发送都盲点鼠标。
+        """
+
+        try:
+            user32 = ctypes.windll.user32
+            # 取当前线程与前台窗口线程，AttachThreadInput 后才能 GetFocus
+            hwnd = self._window.NativeWindowHandle
+            if not hwnd:
+                return
+            fg_tid = user32.GetWindowThreadProcessId(hwnd, None)
+            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            user32.AttachThreadInput(cur_tid, fg_tid, True)
+            try:
+                focused = user32.GetFocus()
+            finally:
+                user32.AttachThreadInput(cur_tid, fg_tid, False)
+            if focused:
+                cls_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(focused, cls_buf, 256)
+                cls_name = cls_buf.value or ""
+                if "Edit" in cls_name or "edit" in cls_name:
+                    return  # 焦点已在输入框，无需点击
+        except Exception as e:
+            self.logger.debug(f"焦点判断失败，回退到点击: {e}")
+
+        # 焦点不在输入框，用坐标兜底点一下
+        self._focus_chat_input()
+
     def _switch_contact(self, contact: str) -> bool:
         """切换到指定联系人/群聊的聊天窗口：Ctrl+F 搜索 → 粘贴 → Enter。"""
 
@@ -607,7 +615,7 @@ class UiaSender(BaseSender):
             self.logger.debug(f"UIA 遍历异常: {e}")
 
         if not edits:
-            self.logger.warning("未找到输入控件，使用坐标后备方案（Qt 界面）")
+            self.logger.info("Qt 界面未暴露 EditControl，启用快捷键发送模式")
             self._use_coord_fallback = True
             return True
 
