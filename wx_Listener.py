@@ -32,31 +32,49 @@ class WeChatListener:
         self.target_chats = target_chats
         self.callback = callback
         self.listen_chats = {}
+        # 跟踪监听失败的聊天，主循环里定期重试
+        self._failed_chats = set()
+        self._last_retry_time = 0
         self.running = False
         logger.info(f"微信监听器初始化成功，登录账号：{self.wx.nickname}")
-        
+
     def start_listening(self):
         """开始监听微信消息"""
         logger.info("开始监听微信消息...")
         self.running = True
-        
+
+        # 启动前等一下，让微信窗口完全就绪（刚启动时 UIA 树可能还没稳定）
+        time.sleep(1)
+
         # 如果指定了目标聊天，则只监听这些聊天
         if self.target_chats:
             for chat in self.target_chats:
                 self._add_listen_chat(chat)
+                # 聊天之间加小延迟，避免 ChatWith 切换太快导致 UIA 找不到控件
+                time.sleep(0.5)
         elif WX_LISTEN_ALL_IF_EMPTY:
             # 监听当前所有聊天窗口，但排除指定的聊天
             session_list = self.wx.GetSessionList(reset=True)
             for chat in session_list:
                 if chat not in WX_EXCLUDED_CHATS:
                     self._add_listen_chat(chat)
+                    time.sleep(0.5)
         else:
             logger.info("未指定目标聊天且未启用监听所有聊天，将不会监听任何聊天")
-        
+
+        # 打印监听状态摘要
+        if self.target_chats:
+            ok = [c for c in self.target_chats if c in self.listen_chats]
+            fail = [c for c in self.target_chats if c not in self.listen_chats]
+            logger.info(f"监听初始化完成: 成功 {len(ok)}/{len(self.target_chats)}"
+                        + (f"，失败 {fail} 将在运行中重试" if fail else ""))
+
         # 开始监听循环
         try:
             while self.running:
                 self._check_new_messages()
+                # 定期重试失败的聊天（每30秒）
+                self._retry_failed_chats()
                 time.sleep(1)  # 每秒检查一次新消息
         except KeyboardInterrupt:
             logger.info("监听被用户中断")
@@ -64,30 +82,66 @@ class WeChatListener:
             logger.error(f"监听过程中发生错误: {str(e)}")
         finally:
             self.stop_listening()
-    
+
     def stop_listening(self):
         """停止监听微信消息"""
         self.running = False
         logger.info("停止监听微信消息")
-    
-    def _add_listen_chat(self, chat_name):
-        """添加监听的聊天对象"""
-        try:
-            # 尝试打开聊天窗口
-            chat_result = self.wx.ChatWith(chat_name)
-            if chat_result:
-                # 添加到监听列表，根据配置决定是否启用图片下载
-                import os
-                savepic = os.getenv('IMAGE_AUTO_DOWNLOAD', 'true').lower() == 'true'
-                self.wx.AddListenChat(chat_name, savepic=savepic, savefile=False, savevoice=False)
-                logger.info(f"添加监听聊天: {chat_name}")
-                return True
-            else:
-                logger.warning(f"无法找到聊天对象: {chat_name}")
-                return False
-        except Exception as e:
-            logger.error(f"添加监听聊天 {chat_name} 时发生错误: {str(e)}")
-            return False
+
+    def _retry_failed_chats(self):
+        """定期重试添加失败的聊天对象"""
+        if not self._failed_chats:
+            return
+        now = time.time()
+        if now - self._last_retry_time < 30:
+            return
+        self._last_retry_time = now
+        pending = list(self._failed_chats)
+        logger.info(f"重试 {len(pending)} 个失败的监听聊天: {pending}")
+        for chat in pending:
+            if self._add_listen_chat(chat):
+                self._failed_chats.discard(chat)
+            time.sleep(0.5)
+        if self._failed_chats:
+            logger.warning(f"仍有 {len(self._failed_chats)} 个聊天监听失败: {list(self._failed_chats)}")
+
+    def _add_listen_chat(self, chat_name, max_retries=3):
+        """添加监听的聊天对象，带重试。
+
+        启动时 WeChat 窗口可能还没完全就绪，或 ChatWith 切换中途被打断，
+        单次失败不放弃，重试 max_retries 次，每次间隔递增（1s/2s/3s）。
+        成功则加入 self.listen_chats，失败则加入 self._failed_chats 待主循环重试。
+        """
+        import os
+        savepic = os.getenv('IMAGE_AUTO_DOWNLOAD', 'true').lower() == 'true'
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 尝试打开聊天窗口
+                chat_result = self.wx.ChatWith(chat_name)
+                if chat_result:
+                    # 添加到监听列表
+                    self.wx.AddListenChat(chat_name, savepic=savepic, savefile=False, savevoice=False)
+                    self.listen_chats[chat_name] = True
+                    self._failed_chats.discard(chat_name)
+                    if attempt > 1:
+                        logger.info(f"✅ 第{attempt}次重试成功，添加监听聊天: {chat_name}")
+                    else:
+                        logger.info(f"添加监听聊天: {chat_name}")
+                    return True
+                else:
+                    logger.warning(f"无法找到聊天对象: {chat_name} (第{attempt}/{max_retries}次)")
+            except Exception as e:
+                logger.warning(f"添加监听聊天 {chat_name} 异常 (第{attempt}/{max_retries}次): {str(e)}")
+
+            # 还有重试机会则等待
+            if attempt < max_retries:
+                time.sleep(attempt)  # 1s, 2s 递增
+
+        # 全部重试失败，记录到待重试集合
+        self._failed_chats.add(chat_name)
+        logger.error(f"❌ 添加监听聊天 {chat_name} 失败（重试{max_retries}次），将在运行中定期重试")
+        return False
     
     def _check_new_messages(self):
         """检查所有监听的聊天是否有新消息"""
