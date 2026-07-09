@@ -40,6 +40,8 @@ WECHAT_IMAGES_SUBDIR = "wechat_images"
 # ============ WeFlow API 路径 ============
 SSE_PUSH_PATH = "/api/v1/push/messages"
 MESSAGES_API_PATH = "/api/v1/messages"
+# 健康检查端点（免 access_token，文档记载）
+HEALTH_PATH = "/api/v1/health"
 
 # ============ 微信消息类型 ============
 # 语音消息 type

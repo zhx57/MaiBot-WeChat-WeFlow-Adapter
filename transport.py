@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 
-from .constants import MESSAGES_API_PATH, SSE_PUSH_PATH
+from .constants import HEALTH_PATH, SSE_PUSH_PATH
 
 
 class WeFlowSSEClient:
@@ -58,10 +58,9 @@ class WeFlowSSEClient:
 
     @property
     def _probe_url(self) -> str:
-        return (
-            f"{self._base_url}{MESSAGES_API_PATH}"
-            f"?access_token={self._access_token}&limit=1"
-        )
+        # 用健康检查端点探活：免 access_token，避免 /api/v1/messages 因缺 talker 参数返回 400。
+        # access_token 有效性由 SSE 连接（_stream_once）的 401 处理覆盖。
+        return f"{self._base_url}{HEALTH_PATH}"
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """惰性创建/复用 ClientSession。"""
@@ -97,16 +96,17 @@ class WeFlowSSEClient:
     # ---------- 对外接口 ----------
 
     async def probe(self) -> bool:
-        """GET 探活。200 返回 True，401 记录 error 返回 False。"""
+        """GET 健康检查探活。
+
+        用 ``/api/v1/health``（免 token）确认 WeFlow 在线。
+        ``access_token`` 有效性由后续 SSE 连接的 401 处理覆盖。
+        """
 
         try:
             session = self._ensure_session()
             async with session.get(self._probe_url) as resp:
                 if resp.status == 200:
                     return True
-                if resp.status == 401:
-                    self._logger.error("WeFlow access_token 无效（HTTP 401）")
-                    return False
                 self._logger.error("WeFlow 探活失败：HTTP %s", resp.status)
                 return False
         except asyncio.CancelledError:
