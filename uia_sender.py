@@ -97,6 +97,31 @@ class UiaSender(BaseSender):
     # 工作线程同步实现
     # ================================================================
 
+    @staticmethod
+    def _has_value_pattern(ctrl) -> bool:
+        """检查控件是否支持 ValuePattern。
+
+        ``uiautomation`` 库不提供 ``IsValuePatternAvailable`` 属性
+        （那是 .NET UIAutomation 的 API），正确做法是尝试 ``GetValuePattern()``
+        并捕获 ``COMError``/``AttributeError``。支持则返回 True。
+        """
+
+        try:
+            ctrl.GetValuePattern()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _has_invoke_pattern(ctrl) -> bool:
+        """检查控件是否支持 InvokePattern。"""
+
+        try:
+            ctrl.GetInvokePattern()
+            return True
+        except Exception:
+            return False
+
     def _ensure_com(self) -> None:
         """确保当前工作线程已 ``CoInitialize``（每线程一次）。
 
@@ -205,17 +230,15 @@ class UiaSender(BaseSender):
 
                 ctrl = self._input_control
 
-                # 设置文本
-                if ctrl.IsValuePatternAvailable:
+                # 设置文本：优先 ValuePattern.SetValue，失败则用剪贴板
+                if self._has_value_pattern(ctrl):
                     try:
-                        ctrl.SetValue("")
+                        vp = ctrl.GetValuePattern()
+                        vp.SetValue("")
                         time.sleep(0.02)
-                    except Exception:
-                        pass
-                    try:
-                        ctrl.SetValue(text)
+                        vp.SetValue(text)
                     except Exception as e:
-                        self.logger.warning(f"SetValue 失败: {e}，尝试剪贴板")
+                        self.logger.warning(f"ValuePattern.SetValue 失败: {e}，尝试剪贴板")
                         import pyperclip
                         pyperclip.copy(text)
                         time.sleep(0.05)
@@ -390,16 +413,8 @@ class UiaSender(BaseSender):
             name = (ctrl.Name or "")[:40]
             cls = ctrl.ClassName or ""
             ctrl_type = ctrl.ControlTypeName
-            vp = (
-                ctrl.IsValuePatternAvailable
-                if hasattr(ctrl, "IsValuePatternAvailable")
-                else "?"
-            )
-            ip = (
-                ctrl.IsInvokePatternAvailable
-                if hasattr(ctrl, "IsInvokePatternAvailable")
-                else "?"
-            )
+            vp = self._has_value_pattern(ctrl)
+            ip = self._has_invoke_pattern(ctrl)
             rect = ctrl.BoundingRectangle
             info = (
                 f"[{rect.left},{rect.top} {rect.width()}x{rect.height()}]"
@@ -554,11 +569,13 @@ class UiaSender(BaseSender):
         if not self._ensure_window():
             return False
 
-        # 如果已有缓存且窗口没变，直接返回
+        # 如果已有缓存且控件仍可用，直接返回
         if self._input_control is not None:
             try:
-                self._input_control.GetCurrentPattern()
-                return True
+                if self._input_control.Exists(0.2):
+                    return True
+                self._input_control = None
+                self._send_button = None
             except Exception:
                 self._input_control = None
                 self._send_button = None
@@ -619,13 +636,14 @@ class UiaSender(BaseSender):
                 continue
 
             name = ctrl.Name or ""
+            has_vp = self._has_value_pattern(ctrl)
             self.logger.debug(
                 f"输入候选: '{name[:30]}' {rect.width()}x{rect.height()} "
-                f"V={ctrl.IsValuePatternAvailable}"
+                f"V={has_vp}"
             )
 
             # 优先使用支持 ValuePattern 的
-            if ctrl.IsValuePatternAvailable:
+            if has_vp:
                 self._input_control = ctrl
                 self.logger.info(
                     f"聊天输入框: {rect.width()}x{rect.height()} (ValuePattern)"
