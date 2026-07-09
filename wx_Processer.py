@@ -419,6 +419,13 @@ class MessageProcessor:
 
             def send_message():
                 try:
+                    # 发送线程也需要 COM 初始化（UIA 操作依赖）
+                    try:
+                        import pythoncom
+                        pythoncom.CoInitialize()
+                    except ImportError:
+                        pass
+
                     # 复用 wx_Listener.py 里的全局 wx 实例，避免每次发送都新建
                     # WeChat() 实例（新建会重复做 UIA 查找窗口、COM 初始化，
                     # 多实例同时操作同一微信窗口会冲突导致发送失败）

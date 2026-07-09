@@ -38,10 +38,23 @@ def run_wx_listener(target_chats=None):
     同时承担入站（微信→麦麦）和出站（麦麦→微信）：
     - 入站：监听微信消息 → message_callback → MessageProcessor → WebSocket → 麦麦
     - 出站：Router(WebSocket) 接收麦麦回复 → _handle_maibot_response → wx.SendMsg → 微信
+
+    注意：本函数在子线程中运行（由 ThreadPoolExecutor 调度）。
+    wxauto 的 UIA 操作需要 COM 初始化，子线程默认不初始化，
+    必须先调用 pythoncom.CoInitialize()，否则报
+    "[WinError -2147221008] 尚未调用 CoInitialize"。
     
     Args:
         target_chats (list, optional): 要监听的聊天对象列表
     """
+    # 子线程使用 COM（UIAutomation）前必须先初始化
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        logger.info("COM 已初始化（监听线程）")
+    except ImportError:
+        logger.warning("pythoncom 不可用，跳过 COM 初始化（UIA 可能报错）")
+
     try:
         logger.info("启动微信消息监听器...")
         
