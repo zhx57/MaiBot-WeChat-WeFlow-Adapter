@@ -41,6 +41,10 @@ class MessageProcessor:
         # 出站时麦麦回复的 receiver_info 里只有 md5 哈希没有可读昵称，
         # 用这个表反查出 wxauto 需要的群名/昵称。
         self._id_to_name = {}
+        # ChatWnd 实例缓存：wxauto 的 WeChat.SendMsg 每次都新建 ChatWnd，
+        # 而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
+        # 缓存后只有第一次发送需要读全部记录，后续发送直接复用，大幅降低延迟。
+        self._chatwnd_cache = {}
         logger.info(f"消息处理器初始化成功，平台：{platform}")
 
         # 初始化Router
@@ -222,6 +226,43 @@ class MessageProcessor:
 
         return receiver
 
+    def _send_text_cached(self, wechat, receiver, content):
+        """通过缓存的 ChatWnd 实例发送文字消息。
+
+        wxauto 的 WeChat.SendMsg 每次都新建 ChatWnd(receiver)，
+        而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
+        缓存后只有第一次发送需要读全部记录，后续发送复用实例。
+        """
+        from wxauto.elements import ChatWnd
+        from wxauto.utils import FindWindow
+
+        # 检查独立聊天窗口(ChatWnd)是否存在
+        if not FindWindow(name=receiver, classname='ChatWnd'):
+            # 没有独立聊天窗口，回退到 wechat.SendMsg
+            logger.warning(f"未找到 {receiver!r} 的独立聊天窗口(ChatWnd)，回退到 wechat.SendMsg")
+            wechat.SendMsg(content, receiver)
+            return
+
+        chatwnd = self._chatwnd_cache.get(receiver)
+        if chatwnd is None:
+            logger.info(f"首次发送到 {receiver!r}，创建 ChatWnd 实例（需读取聊天记录，稍慢）")
+            chatwnd = ChatWnd(receiver, wechat.language)
+            self._chatwnd_cache[receiver] = chatwnd
+
+        try:
+            chatwnd.SendMsg(content)
+        except Exception as e:
+            # 窗口可能已关闭，清除缓存并重试一次
+            logger.warning(f"缓存的 ChatWnd 发送失败({e})，清除缓存重试")
+            self._chatwnd_cache.pop(receiver, None)
+            if not FindWindow(name=receiver, classname='ChatWnd'):
+                logger.error(f"重试失败：{receiver!r} 的独立聊天窗口已不存在")
+                wechat.SendMsg(content, receiver)
+                return
+            chatwnd = ChatWnd(receiver, wechat.language)
+            self._chatwnd_cache[receiver] = chatwnd
+            chatwnd.SendMsg(content)
+
     async def _process_message_segments(self, message_segment, receiver):
         """递归处理消息段，支持多段消息"""
         try:
@@ -323,17 +364,8 @@ class MessageProcessor:
                     if wechat is None:
                         raise RuntimeError("全局 wxauto.WeChat 实例未初始化")
 
-                    # 诊断：打印 receiver 的确切值和类型，排查名字对不上的问题
+                    # 诊断：打印 receiver 的确切值和类型
                     logger.info(f"开始发送到微信: receiver={receiver!r} (type={type(receiver).__name__}), content={str(content)[:80]}")
-
-                    # 前置检查：尝试切换到目标聊天，单独执行并打日志
-                    # 如果 ChatWith 失败，后面的 SendMsg 不会执行（解释了剪贴板为空）
-                    try:
-                        wechat.ChatWith(receiver)
-                        logger.info(f"✅ 已切换到聊天: {receiver!r}")
-                    except Exception as chat_err:
-                        logger.error(f"❌ 切换聊天失败 (receiver={receiver!r}): {chat_err}")
-                        raise
 
                     # 检查是否是base64编码的图片数据
                     if isinstance(content, str) and (content.startswith('data:image/') or len(content) > 1000 and content.replace('+', '').replace('/', '').replace('=', '').isalnum()):
@@ -401,8 +433,11 @@ class MessageProcessor:
                             logger.info(f"已发送文字内容: {receiver} - {content}")
                     else:
                         # 普通文字消息
-                        logger.info(f"调用 wechat.SendMsg: receiver={receiver}")
-                        wechat.SendMsg(content, receiver)
+                        # 优化：缓存 ChatWnd 实例。wechat.SendMsg 每次都新建 ChatWnd(receiver)，
+                        # 而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
+                        # 缓存后只有第一次需要读全部记录，后续发送复用实例，大幅降低延迟。
+                        logger.info(f"调用发送文字消息: receiver={receiver}")
+                        self._send_text_cached(wechat, receiver, content)
                         logger.info(f"✅ 已发送文字消息到微信: {receiver} - {content}")
 
                 except Exception as e:
