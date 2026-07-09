@@ -19,10 +19,9 @@
 **🚀 WeMai是一个微信消息双向转发系统**
 
 - 💬 **微信监听**：实时监听微信消息并转发
-- 🔄 **双向通信**：支持微信→MaiBot和MaiBot→微信双向消息传递
+- 🔄 **双向通信**：支持微信→MaiBot和MaiBot→微信双向消息传递（WebSocket，无需 Redis）
 - 🔧 **灵活配置**：支持通过环境变量自定义配置
 - 🛡️ **稳定可靠**：自动监控和重启机制
-- 🔄 **消息队列**：使用Redis作为消息中间件
 - 😘 **表情包**：支持发送表情包
 - 🖨 **图片识别**：支持自动识别聊天中的图片
 
@@ -31,7 +30,7 @@
 | 模块 | 主要功能 | 特点 |
 |------|---------|------|
 | 🔄 **消息转发** | • 微信消息→MaiBot<br>• MaiBot回复→微信<br>• 消息格式转换<br>• 消息去重 | 双向通信 |
-| 🛠️ **统一管理** | • 统一入口<br>• 命令行参数<br>• 自动重启<br>• 优雅停止 | 稳定可靠 |
+| 🛠 **统一管理** | • 统一入口<br>• 命令行参数<br>• 自动重启<br>• 优雅停止 | 稳定可靠 |
 | 🔧 **灵活配置** | • 环境变量配置<br>• 聊天对象过滤<br>• 自定义监听范围 | 易于定制 |
 | 🔍 **消息过滤** | • 自动过滤自己发送的消息<br>• 排除系统消息<br>• 自定义排除列表 | 精准转发 |
 | 📊 **日志记录** | • 详细日志<br>• 群组ID哈希映射<br>• 错误追踪 | 便于排查 |
@@ -42,7 +41,7 @@
 
 - Python 3.8+
 - 微信桌面版（3.9.11.17）
-- Redis服务器
+- MaiBot（>=1.0.0）
 
 ### 微信关闭自动更新方法
 
@@ -51,9 +50,7 @@
 
 ### 安装步骤
 
-1. 安装redis,记录你的redis服务器地址及端口，用于.env文件修改，本地远端均可
-
-2. 安装maibot，参考https://github.com/MaiM-with-u/MaiBot
+1. 安装maibot，参考https://github.com/MaiM-with-u/MaiBot
    > [!INFO]
    > - 请自己研究maibot，找到适合自己的部署方式。
    > - 这里仅提供部署思路，maibot本质上是一个完善的闭环机器人，她拥有消息收发处理机制
@@ -62,11 +59,11 @@
    > 详细处理逻辑和maibot部署方式可参考：https://mp.weixin.qq.com/s/79ZdJqZ7VI0bFsg14Hf00w
    > - 注意记录服务器地址和ip，后续修改.env环境变量要用到
 
-3. 运行本项目
-   > 如果看完了前两步，你应该部署好了属于自己的redis数据库和maibot
+2. 运行本项目
+   > 如果看完了第一步，你应该部署好了属于自己的maibot
    > 那么，可以开始部署和运行本项目了
    ```bash
-   git clone https://github.com/Angela459/WeMai.git
+   git clone https://github.com/zhx57/WeMai.git
    cd wemai
    pip install -r requirements.txt
    cp .env.example .env
@@ -99,16 +96,13 @@ optional arguments:
 ```mermaid
 graph TD
     A[main.py] --> B[wx_Listener.py]
-    A --> C[mq_Producer.py]
-    A --> D[mq_Consumer.py]
-    B --> E[wx_Processer.py]
     B -->|监听微信消息| F[微信]
-    E -->|转换消息格式| G[MaiBot API]
-    C -->|接收MaiBot响应| G
-    C -->|写入消息队列| H[Redis]
-    D -->|读取消息队列| H
-    D -->|发送消息| F
+    B --> E[wx_Processer.py]
+    E -->|WebSocket 双向通信| G[MaiBot]
+    E -->|Router 接收回复| F
 ```
+
+新版麦麦用 `maim_message` 的纯 WebSocket 做双向通信，`wx_Processer` 里的 Router 同时处理入站（微信→麦麦）和出站（麦麦→微信），**无需 Redis 队列中转**，架构更简单。
 
 ## ⚙️ 配置说明
 
@@ -119,11 +113,9 @@ WeMai使用`.env`文件进行配置，主要配置项包括：
 | WX_TARGET_CHATS | 要监听的聊天对象列表 | 空（由命令行参数决定） |
 | WX_LISTEN_ALL_IF_EMPTY | 是否监听所有聊天 | false |
 | WX_EXCLUDED_CHATS | 排除的聊天对象 | 文件传输助手,微信团队,微信支付 |
-| MAIBOT_API_URL | MaiBot API地址 | ws://127.0.0.1:8000/ws |
-| REDIS_URL | Redis连接地址 | redis://your-ip:your-port |
-| REDIS_QUEUE_KEY | Redis队列键名 | autoText |
-| API_HOST | API监听地址 | 0.0.0.0 |
-| API_PORT | API监听端口 | 8000 |
+| MAIBOT_API_URL | MaiBot WebSocket地址 | ws://127.0.0.1:8000/ws |
+| PLATFORM_ID | 平台标识 | wxauto |
+| WX_BOT_NICKNAME | 机器人自己的微信昵称（可选，用于排除自身） | 空 |
 
 ## 🔌 适配新版麦麦（重要）
 

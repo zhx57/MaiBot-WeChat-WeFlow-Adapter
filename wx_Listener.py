@@ -19,12 +19,16 @@ class WeChatListener:
     def __init__(self, target_chats=None, callback=None):
         """
         初始化微信消息监听器
-        
+
         Args:
             target_chats (list, optional): 要监听的聊天对象列表，如果为None则监听所有聊天
             callback (function, optional): 收到新消息时的回调函数，接收参数为(chat_name, message_data)
         """
         self.wx = WeChat()
+        # 把 wx 实例挂到模块级全局变量，供 wx_Processer 发送消息时复用
+        # （发送和监听必须用同一个 WeChat 实例，多实例同时操作同一微信窗口会冲突）
+        global wx
+        wx = self.wx
         self.target_chats = target_chats
         self.callback = callback
         self.listen_chats = {}
@@ -149,6 +153,11 @@ class WeChatListener:
 
 # 全局消息处理器实例
 global_processor = None
+
+# 全局 wxauto.WeChat 实例
+# 由 WeChatListener.__init__ 创建并赋值，供 wx_Processer 发送消息时复用
+# （发送和监听必须用同一个 WeChat 实例，多实例同时操作同一微信窗口会冲突）
+wx = None
 
 def set_global_processor(processor):
     """设置全局消息处理器"""

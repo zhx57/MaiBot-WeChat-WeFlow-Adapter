@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import logging
 import signal
 import sys
@@ -8,9 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
 # 导入各个组件
+# 新版麦麦用 WebSocket 双向通信，Router 在 wx_Processer 里同时处理
+# 入站（微信→麦麦）和出站（麦麦→微信），不再需要 mq_Producer/mq_Consumer
+# 的 Redis 队列中转，因此移除了这两个组件的启动逻辑。
 from wx_Listener import WeChatListener, message_callback, set_global_processor, create_message_processor
-from mq_Consumer import main as consumer_main
-from config import WX_TARGET_CHATS, LOG_LEVEL, LOG_FORMAT, LOG_DATE_FORMAT, LOG_FILE, API_HOST, API_PORT
+from config import WX_TARGET_CHATS, LOG_LEVEL, LOG_FORMAT, LOG_DATE_FORMAT, LOG_FILE
 
 # 配置日志
 logging.basicConfig(
@@ -33,6 +34,10 @@ signal_handled = False
 def run_wx_listener(target_chats=None):
     """
     运行微信消息监听器
+
+    同时承担入站（微信→麦麦）和出站（麦麦→微信）：
+    - 入站：监听微信消息 → message_callback → MessageProcessor → WebSocket → 麦麦
+    - 出站：Router(WebSocket) 接收麦麦回复 → _handle_maibot_response → wx.SendMsg → 微信
     
     Args:
         target_chats (list, optional): 要监听的聊天对象列表
@@ -45,7 +50,7 @@ def run_wx_listener(target_chats=None):
         set_global_processor(processor)
         logger.info("全局消息处理器已初始化")
         
-        # 启动Router（在后台线程中运行）
+        # 启动Router（在后台线程中运行，处理与麦麦的 WebSocket 双向通信）
         import threading
         router_thread = threading.Thread(target=processor.start_router)
         router_thread.daemon = True
@@ -86,130 +91,6 @@ def run_wx_listener(target_chats=None):
             time.sleep(5)  # 等待5秒后重试
             run_wx_listener(target_chats)
 
-# 消息队列消费者进程
-async def run_mq_consumer():
-    """运行消息队列消费者"""
-    try:
-        logger.info("启动消息队列消费者...")
-        
-        # 创建任务
-        consumer_task = asyncio.create_task(consumer_main())
-        
-        # 等待停止事件
-        while not stop_event.is_set():
-            await asyncio.sleep(1)
-        
-        # 取消任务
-        consumer_task.cancel()
-        try:
-            await consumer_task
-        except asyncio.CancelledError:
-            logger.info("消息队列消费者已停止")
-            
-    except Exception as e:
-        logger.error(f"消息队列消费者发生错误: {str(e)}")
-        if not stop_event.is_set():
-            logger.info("尝试重启消息队列消费者...")
-            await asyncio.sleep(5)  # 等待5秒后重试
-            await run_mq_consumer()
-
-# 消息队列生产者进程（同步版本）
-def run_mq_producer():
-    """运行消息队列生产者（FastAPI应用）- 同步版本"""
-    try:
-        logger.info("启动消息队列生产者...")
-        
-        # 导入并运行FastAPI应用
-        from mq_Producer import app
-        import uvicorn
-        
-        # 设置uvicorn日志配置
-        log_config = uvicorn.config.LOGGING_CONFIG
-        log_config["formatters"]["access"]["fmt"] = LOG_FORMAT
-        
-        # 在新线程中设置事件循环并启动服务器
-        def run_server():
-            try:
-                # 设置事件循环
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # 直接使用 uvicorn.run() 启动服务器
-                uvicorn.run(
-                    app,
-                    host=API_HOST,
-                    port=API_PORT,
-                    log_config=log_config,
-                    access_log=True,
-                    loop=loop  # 显式指定事件循环
-                )
-            except Exception as e:
-                logger.error(f"服务器运行错误: {str(e)}")
-        
-        # 在单独的线程中运行服务器
-        server_thread = threading.Thread(target=run_server)
-        server_thread.daemon = True
-        server_thread.start()
-        
-        # 等待服务器线程结束
-        server_thread.join()
-        
-    except Exception as e:
-        logger.error(f"消息队列生产者发生错误: {str(e)}")
-        if not stop_event.is_set():
-            logger.info("尝试重启消息队列生产者...")
-            time.sleep(5)  # 等待5秒后重试
-            run_mq_producer()
-
-# 消息队列生产者进程（异步版本）
-async def run_mq_producer_async():
-    """运行消息队列生产者（FastAPI应用）- 异步版本"""
-    try:
-        logger.info("启动消息队列生产者...")
-        
-        # 导入并运行FastAPI应用
-        from mq_Producer import app
-        import uvicorn
-        
-        # 设置uvicorn日志配置
-        log_config = uvicorn.config.LOGGING_CONFIG
-        log_config["formatters"]["access"]["fmt"] = LOG_FORMAT
-        
-        # 创建服务器配置
-        config = uvicorn.Config(
-            app,
-            host=API_HOST,
-            port=API_PORT,
-            log_config=log_config,
-            access_log=True
-        )
-        
-        # 创建服务器实例
-        server = uvicorn.Server(config)
-        
-        # 注册停止事件处理
-        def check_stop():
-            while not stop_event.is_set():
-                time.sleep(1)
-            logger.info("正在关闭FastAPI服务器...")
-            server.should_exit = True
-        
-        # 启动停止检查线程
-        import threading
-        stop_thread = threading.Thread(target=check_stop)
-        stop_thread.daemon = True
-        stop_thread.start()
-        
-        # 启动服务器
-        await server.serve()
-        
-    except Exception as e:
-        logger.error(f"消息队列生产者发生错误: {str(e)}")
-        if not stop_event.is_set():
-            logger.info("尝试重启消息队列生产者...")
-            await asyncio.sleep(5)  # 等待5秒后重试
-            await run_mq_producer_async()
-
 # 信号处理函数
 def handle_signal(sig, frame):
     """处理终止信号"""
@@ -246,24 +127,17 @@ async def main(args):
     signal.signal(signal.SIGTERM, handle_signal)
     
     # 创建线程池
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # 新版麦麦用 WebSocket 双向通信，Router 统一处理收发，
+    # 只需启动微信监听器一个进程即可。
+    with ThreadPoolExecutor(max_workers=1) as executor:
         tasks = []
         
-        # 根据参数启动相应的服务
-        if args.all or args.wx_to_maibot:
-            # 启动微信监听器
-            wx_future = executor.submit(
-                run_wx_listener, 
-                args.target_chats.split(',') if args.target_chats else WX_TARGET_CHATS
-            )
-            tasks.append(wx_future)
-        
-        if args.all or args.maibot_to_wx:
-            # 启动消息队列消费者
-            consumer_task = asyncio.create_task(run_mq_consumer())
-            
-            # 启动消息队列生产者（在主线程中运行）
-            producer_task = asyncio.create_task(run_mq_producer_async())
+        # 启动微信监听器（含 Router 双向通信）
+        wx_future = executor.submit(
+            run_wx_listener, 
+            args.target_chats.split(',') if args.target_chats else WX_TARGET_CHATS
+        )
+        tasks.append(wx_future)
         
         # 等待停止事件
         try:
@@ -286,19 +160,6 @@ async def main(args):
         
         logger.info("正在等待所有任务完成...")
         
-        # 取消消费者和生产者任务
-        if args.all or args.maibot_to_wx:
-            consumer_task.cancel()
-            producer_task.cancel()
-            try:
-                await consumer_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await producer_task
-            except asyncio.CancelledError:
-                pass
-        
         # 等待最多10秒让其他任务完成
         timeout = time.time() + 10
         while time.time() < timeout:
@@ -315,9 +176,9 @@ async def main(args):
 
 if __name__ == "__main__":
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description="WePush - 微信消息转发服务")
+    parser = argparse.ArgumentParser(description="WeMai - 微信消息转发服务")
     
-    # 服务选择参数
+    # 服务选择参数（保留向后兼容，但实际都只启动微信监听器+Router）
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--all', action='store_true', help='启动所有服务（默认）')
     group.add_argument('--wx-to-maibot', action='store_true', help='仅启动微信到MaiBot的消息转发')
@@ -329,21 +190,12 @@ if __name__ == "__main__":
     # 解析参数
     args = parser.parse_args()
     
-    # 如果没有指定服务，默认启动所有服务
-    if not (args.all or args.wx_to_maibot or args.maibot_to_wx):
-        args.all = True
-    
     # 打印启动信息
     logger.info("=" * 50)
-    logger.info("WePush - 微信消息转发服务")
+    logger.info("WeMai - 微信消息转发服务")
     logger.info("=" * 50)
     
-    if args.all:
-        logger.info("启动模式: 全部服务")
-    elif args.wx_to_maibot:
-        logger.info("启动模式: 仅微信到MaiBot")
-    elif args.maibot_to_wx:
-        logger.info("启动模式: 仅MaiBot到微信")
+    logger.info("启动模式: 全部服务（WebSocket 双向通信，无需 Redis）")
     
     if args.target_chats:
         logger.info(f"监听聊天: {args.target_chats}")
@@ -354,6 +206,7 @@ if __name__ == "__main__":
     
     # 运行主函数
     try:
+        import asyncio
         asyncio.run(main(args))
     except KeyboardInterrupt:
         logger.info("程序被用户中断")

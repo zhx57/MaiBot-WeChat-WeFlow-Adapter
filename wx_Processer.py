@@ -419,10 +419,10 @@ class MessageProcessor:
 
             def send_message():
                 try:
-                    # 复用 mq_Consumer.py 里的全局 wx 实例，避免每次发送都新建
+                    # 复用 wx_Listener.py 里的全局 wx 实例，避免每次发送都新建
                     # WeChat() 实例（新建会重复做 UIA 查找窗口、COM 初始化，
                     # 多实例同时操作同一微信窗口会冲突导致发送失败）
-                    from mq_Consumer import wx as wechat
+                    from wx_Listener import wx as wechat
                     import base64
                     import tempfile
                     import os

@@ -41,14 +41,6 @@ WX_EXCLUDED_CHATS = _parse_list(
 # 端口对应 bot_config.toml 里 [maim_message].ws_server_port（默认 8000）。
 MAIBOT_API_URL = os.getenv('MAIBOT_API_URL', 'ws://127.0.0.1:8000/ws')
 
-# Redis 配置
-REDIS_URL = os.getenv('REDIS_URL', 'redis://192.168.8.124:6379')
-REDIS_QUEUE_KEY = os.getenv('REDIS_QUEUE_KEY', 'autoText')
-
-# 消息队列生产者（FastAPI）配置
-API_HOST = os.getenv('API_HOST', '0.0.0.0')
-API_PORT = int(os.getenv('API_PORT', '8000'))
-
 # 日志配置
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FILE = os.getenv('LOG_FILE', 'wepush.log')
@@ -62,14 +54,11 @@ PLATFORM_ID = os.getenv('PLATFORM_ID', 'wxauto')
 def print_config_info():
     """打印当前加载的配置信息"""
     logger = logging.getLogger(__name__)
-    logger.info("\n=== WePush 配置信息 ===")
+    logger.info("\n=== WeMai 配置信息 ===")
     logger.info(f"\u5fae信监听目标: {WX_TARGET_CHATS}")
     logger.info(f"\u76d1听所有聊天: {WX_LISTEN_ALL_IF_EMPTY}")
     logger.info(f"\u6392除的聊天: {WX_EXCLUDED_CHATS}")
     logger.info(f"MaiBot API URL: {MAIBOT_API_URL}")
-    logger.info(f"Redis URL: {REDIS_URL}")
-    logger.info(f"Redis 队列键: {REDIS_QUEUE_KEY}")
-    logger.info(f"API 监听地址: {API_HOST}:{API_PORT}")
     logger.info(f"\u65e5志级别: {LOG_LEVEL}")
     logger.info(f"\u5e73台标识: {PLATFORM_ID}")
     logger.info("==========================\n")
