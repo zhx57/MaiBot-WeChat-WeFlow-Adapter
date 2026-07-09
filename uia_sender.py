@@ -570,8 +570,11 @@ class UiaSender(BaseSender):
     def _locate_input(self) -> bool:
         """定位聊天输入框和发送按钮。
 
-        在 Electron 中，聊天输入框是 EditControl（支持 ValuePattern），位于窗口下半部分；
-        找不到时启用坐标后备方案。
+        在 Electron / Qt 两种界面下都能工作：
+        - Electron (微信 4.0)：EditControl 支持 ValuePattern，位于窗口下半部分
+        - Qt (微信 3.9)：EditControl 的 ControlTypeName 可能是 "Edit Control"
+          （带空格），且 Name 常为「输入」/「消息输入框」
+        找不到 EditControl 时启用快捷键发送模式。
         """
 
         if not self._ensure_window():
@@ -599,9 +602,11 @@ class UiaSender(BaseSender):
             try:
                 for child in ctrl.GetChildren():
                     try:
-                        cn = child.ControlTypeName
-                        # 输入控件
-                        if cn == "EditControl":
+                        cn = child.ControlTypeName or ""
+                        cls = child.ClassName or ""
+                        # 输入控件：兼容 "EditControl" 和 "Edit Control" 两种写法，
+                        # 同时用 ClassName 兜底（Qt 微信可能用不同的类型名）
+                        if "Edit" in cn.replace(" ", "") or "Edit" in cls:
                             edits.append(child)
                         walk(child, depth + 1)
                     except Exception:
@@ -614,10 +619,43 @@ class UiaSender(BaseSender):
         except Exception as e:
             self.logger.debug(f"UIA 遍历异常: {e}")
 
+        # walk 找不到时，用 uiautomation 库原生 EditControl() 兜底搜索。
+        # Qt 微信的控件树结构复杂，手动递归可能因中间容器异常而漏掉；
+        # 库的 EditControl() 内部用 UIA FindFirst，覆盖更全。
         if not edits:
-            self.logger.info("Qt 界面未暴露 EditControl，启用快捷键发送模式")
+            self.logger.debug("手动遍历未找到 EditControl，尝试库原生搜索...")
+            try:
+                native_edit = self._window.EditControl(searchDepth=10)
+                if native_edit.Exists(0.5):
+                    edits.append(native_edit)
+                    self.logger.debug(
+                        f"库原生搜索找到 EditControl: "
+                        f"Name='{(native_edit.Name or '')[:30]}' "
+                        f"Class='{native_edit.ClassName}'"
+                    )
+            except Exception as e:
+                self.logger.debug(f"库原生 EditControl 搜索失败: {e}")
+
+        if not edits:
+            self.logger.info(
+                f"未找到输入控件 (ClassName={self._window.ClassName})，"
+                f"启用快捷键发送模式"
+            )
             self._use_coord_fallback = True
             return True
+
+        # 诊断日志：列出找到的所有 EditControl，方便排查 Qt 微信的控件结构
+        for e in edits:
+            try:
+                r = e.BoundingRectangle
+                self.logger.debug(
+                    f"EditControl 候选: Name='{(e.Name or '')[:30]}' "
+                    f"Class='{e.ClassName}' "
+                    f"rect=[{r.left},{r.top} {r.width()}x{r.height()}] "
+                    f"V={self._has_value_pattern(e)}"
+                )
+            except Exception:
+                pass
 
         # 过滤：聊天输入框在窗口下半部分，面积较大
         candidates = [
