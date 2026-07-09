@@ -34,16 +34,19 @@ signal_handled = False
 # 微信监听器进程
 def run_wx_listener(target_chats=None):
     """
-    运行微信消息监听器
+    运行微信消息监听器（在子线程中运行，由 ThreadPoolExecutor 调度）。
 
     同时承担入站（微信→麦麦）和出站（麦麦→微信）：
     - 入站：监听微信消息 → message_callback → MessageProcessor → WebSocket → 麦麦
     - 出站：Router(WebSocket) 接收麦麦回复 → _handle_maibot_response → wx.SendMsg → 微信
 
-    注意：本函数在子线程中运行（由 ThreadPoolExecutor 调度）。
     wxauto 的 UIA 操作需要 COM 初始化，子线程默认不初始化，
-    必须先调用 pythoncom.CoInitialize()，否则报
-    "[WinError -2147221008] 尚未调用 CoInitialize"。
+    必须先调用 pythoncom.CoInitialize()。
+
+    失败时用 while 循环重试（不递归），避免：
+    1. 递归深度过大导致栈溢出
+    2. 旧 Router daemon 线程未清理就启动新的，导致多个 WebSocket 连接并存
+    重试有上限（10次），超过则放弃，让主进程退出而非无限重启。
     
     Args:
         target_chats (list, optional): 要监听的聊天对象列表
@@ -56,54 +59,69 @@ def run_wx_listener(target_chats=None):
     except ImportError:
         logger.warning("pythoncom 不可用，跳过 COM 初始化（UIA 可能报错）")
 
-    try:
-        logger.info("启动微信消息监听器...")
-        
-        # 初始化全局消息处理器
-        processor = create_message_processor()
-        set_global_processor(processor)
-        logger.info("全局消息处理器已初始化")
-        
-        # 启动Router（在后台线程中运行，处理与麦麦的 WebSocket 双向通信）
-        import threading
-        router_thread = threading.Thread(target=processor.start_router)
-        router_thread.daemon = True
-        router_thread.start()
-        logger.info("Router已启动")
-        
-        # 显示监听的聊天对象及其哈希值，便于配置MaiBot的白名单
-        if target_chats:
-            import hashlib
-            logger.info("监听的聊天对象及其ID哈希值（请将需要的群组ID添加到MaiBot的白名单中）：")
-            for chat in target_chats:
-                chat_id = hashlib.md5(chat.encode('utf-8')).hexdigest()
-                logger.info(f"  {chat} -> {chat_id}")
-        
-        listener = WeChatListener(
-            target_chats=target_chats,
-            callback=message_callback
-        )
-        
-        # 注册停止事件处理
-        def check_stop():
-            while not stop_event.is_set():
-                time.sleep(1)
-            listener.stop_listening()
-        
-        # 启动停止检查线程
-        stop_thread = threading.Thread(target=check_stop)
-        stop_thread.daemon = True
-        stop_thread.start()
-        
-        # 开始监听
-        listener.start_listening()
-        
-    except Exception as e:
-        logger.error(f"微信监听器发生错误: {str(e)}")
-        if not stop_event.is_set():
-            logger.info("尝试重启微信监听器...")
-            time.sleep(5)  # 等待5秒后重试
-            run_wx_listener(target_chats)
+    MAX_RESTART = 10  # 最大重启次数，超过则放弃（避免无限重启死循环）
+    restart_count = 0
+
+    while restart_count < MAX_RESTART and not stop_event.is_set():
+        try:
+            logger.info(f"启动微信消息监听器...（第 {restart_count + 1} 次启动）")
+            
+            # 初始化全局消息处理器
+            processor = create_message_processor()
+            set_global_processor(processor)
+            logger.info("全局消息处理器已初始化")
+            
+            # 启动Router（在后台线程中运行，处理与麦麦的 WebSocket 双向通信）
+            import threading
+            router_thread = threading.Thread(target=processor.start_router)
+            router_thread.daemon = True
+            router_thread.start()
+            logger.info("Router已启动")
+            
+            # 显示监听的聊天对象及其哈希值，便于配置MaiBot的白名单
+            if target_chats:
+                import hashlib
+                logger.info("监听的聊天对象及其ID哈希值（请将需要的群组ID添加到MaiBot的白名单中）：")
+                for chat in target_chats:
+                    chat_id = hashlib.md5(chat.encode('utf-8')).hexdigest()
+                    logger.info(f"  {chat} -> {chat_id}")
+            
+            listener = WeChatListener(
+                target_chats=target_chats,
+                callback=message_callback
+            )
+            
+            # 注册停止事件处理
+            def check_stop():
+                while not stop_event.is_set():
+                    time.sleep(1)
+                listener.stop_listening()
+            
+            # 启动停止检查线程
+            stop_thread = threading.Thread(target=check_stop)
+            stop_thread.daemon = True
+            stop_thread.start()
+            
+            # 开始监听（阻塞直到异常或停止）
+            listener.start_listening()
+            
+            # 正常退出循环（start_listening 返回而非抛异常）
+            break
+            
+        except Exception as e:
+            restart_count += 1
+            logger.error(f"微信监听器发生错误: {str(e)}（第 {restart_count}/{MAX_RESTART} 次重启）")
+            if stop_event.is_set():
+                break
+            if restart_count >= MAX_RESTART:
+                logger.error(f"❌ 已达最大重启次数 {MAX_RESTART}，放弃重启")
+                break
+            logger.info(f"等待5秒后重试...")
+            time.sleep(5)
+
+    if restart_count >= MAX_RESTART:
+        logger.error("微信监听器重启次数耗尽，设置停止事件通知主进程退出")
+        stop_event.set()
 
 # 信号处理函数
 def handle_signal(sig, frame):

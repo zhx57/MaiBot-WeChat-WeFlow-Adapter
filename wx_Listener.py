@@ -193,6 +193,12 @@ class WeChatListener:
         成功则加入 self.listen_chats，失败则加入 self._failed_chats 待主循环重试。
         每次重试前清空搜索框，避免搜索词重复累积。
         每次重试前检查微信窗口是否存活，不存活则跳过（等主循环的重连逻辑处理）。
+
+        注意：wxauto 的 AddListenChat 内部已经做了 ChatWith + 双击弹独立窗口
+        + ChatWnd(who)（会调 GetAllMessage 读全部记录，10s+）。
+        之前 WeMai 在调用 AddListenChat 前先 ChatWith 预检，导致 ChatWith
+        被调用两次，初始化时间翻倍。现在直接调 AddListenChat，用 try-catch
+        判断成功/失败。
         """
         import os
         savepic = os.getenv('IMAGE_AUTO_DOWNLOAD', 'true').lower() == 'true'
@@ -209,20 +215,16 @@ class WeChatListener:
                 # 重试前清空搜索框，避免上次残留的搜索词和本次叠加
                 self._clear_search_box()
 
-                # 尝试打开聊天窗口
-                chat_result = self.wx.ChatWith(chat_name)
-                if chat_result:
-                    # 添加到监听列表
-                    self.wx.AddListenChat(chat_name, savepic=savepic, savefile=False, savevoice=False)
-                    self.listen_chats[chat_name] = True
-                    self._failed_chats.discard(chat_name)
-                    if attempt > 1:
-                        logger.info(f"✅ 第{attempt}次重试成功，添加监听聊天: {chat_name}")
-                    else:
-                        logger.info(f"添加监听聊天: {chat_name}")
-                    return True
+                # 直接调用 AddListenChat（内部会 ChatWith + 双击弹窗 + ChatWnd）
+                # 不再预先 ChatWith，避免重复切换聊天导致初始化时间翻倍
+                self.wx.AddListenChat(chat_name, savepic=savepic, savefile=False, savevoice=False)
+                self.listen_chats[chat_name] = True
+                self._failed_chats.discard(chat_name)
+                if attempt > 1:
+                    logger.info(f"✅ 第{attempt}次重试成功，添加监听聊天: {chat_name}")
                 else:
-                    logger.warning(f"无法找到聊天对象: {chat_name} (第{attempt}/{max_retries}次)")
+                    logger.info(f"添加监听聊天: {chat_name}")
+                return True
             except Exception as e:
                 logger.warning(f"添加监听聊天 {chat_name} 异常 (第{attempt}/{max_retries}次): {str(e)}")
                 # ChatWith 内部可能因 _show 失败留下脏状态，尝试刷新一下
@@ -255,16 +257,21 @@ class WeChatListener:
                         # 处理每条消息
                         for msg in messages:
                             self._process_message(chat_name, msg)
+            # 成功调用，重置连续失败计数
+            self._msg_fail_count = 0
         except Exception as e:
             logger.error(f"检查新消息时发生错误: {str(e)}")
-            # 如果 GetListenMessage 持续失败，可能是监听失效，
-            # 把所有监听聊天标记为失败，让 _retry_failed_chats 重新添加
-            err_str = str(e).lower()
-            if any(k in err_str for k in ['not found', '找不到', '不存在', 'none', 'attribute']):
-                logger.warning("监听可能已失效，将重新初始化所有监听聊天")
+            # 用连续失败计数器判断是否需要重建监听，避免偶发错误误清空
+            # 之前用宽泛关键词（'none'/'attribute'）匹配，一次 AttributeError
+            # 就把所有 listen_chats 清空，导致监听被频繁重建
+            self._msg_fail_count = getattr(self, '_msg_fail_count', 0) + 1
+            if self._msg_fail_count >= 5:
+                logger.warning(f"GetListenMessage 连续失败 {self._msg_fail_count} 次，"
+                               f"监听可能已失效，将重新初始化所有监听聊天")
                 for chat_name in list(self.listen_chats.keys()):
                     self._failed_chats.add(chat_name)
                 self.listen_chats.clear()
+                self._msg_fail_count = 0  # 重置，等重建后再计
 
     def _is_wechat_alive(self):
         """检测微信主窗口是否还存在。

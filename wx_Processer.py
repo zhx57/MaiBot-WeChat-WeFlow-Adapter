@@ -27,9 +27,12 @@ class _SendOnlyChatWnd:
         self.savepic = False
         self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who)
         self.editbox = self.UiaAPI.EditControl()
-        # 复用 ChatWnd 的 _show / SendMsg 方法实现
+        # 复用 ChatWnd 的 _show / SendMsg / SendFiles 方法实现
+        # SendFiles 也只用 editbox（Ctrl+a/Ctrl+v/Enter），不需要 C_MsgList，
+        # 绑定后图片/文件发送也能复用缓存实例，避免每次新建 ChatWnd 调 GetAllMessage
         self._show = ChatWnd._show.__get__(self, ChatWnd)
         self.SendMsg = ChatWnd.SendMsg.__get__(self, ChatWnd)
+        self.SendFiles = ChatWnd.SendFiles.__get__(self, ChatWnd)
 
 
 # 配置日志
@@ -121,6 +124,12 @@ class MessageProcessor:
                 # 创建新的事件循环
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                
+                # 保存事件循环引用，供 _send_to_maibot 跨线程提交协程用
+                # （router.send_message 复用 Router 的 WebSocket 连接，必须在
+                # 同一事件循环上执行，跨循环用 asyncio.run 会抛
+                # "Future attached to a different loop"）
+                self._router_loop = loop
                 
                 # 初始化消息发送队列
                 self.send_queue = asyncio.Queue()
@@ -326,6 +335,37 @@ class MessageProcessor:
             self._chatwnd_cache[receiver] = chatwnd
             chatwnd.SendMsg(content)
 
+    def _send_file_cached(self, wechat, receiver, filepath):
+        """通过缓存的轻量 ChatWnd 实例发送文件/图片。
+
+        原版 wechat.SendFiles(filepath, receiver) 有两个问题：
+        1. 内部 if FindWindow(name=who, classname='ChatWnd') 不存在就 return False，
+           没有独立聊天窗口时图片静默丢失（不报错）
+        2. 内部 chat = ChatWnd(who) 会调 GetAllMessage() 读取全部聊天记录（10s+）
+        改用缓存实例 + _ensure_chatwnd 弹窗，保证图片能发出且快速。
+        """
+        # 1) 确保独立聊天窗口存在
+        if not self._ensure_chatwnd(wechat, receiver):
+            logger.error(f"{receiver!r} 无法建立独立聊天窗口，文件发送失败: {filepath}")
+            return
+        # 2) 获取/创建缓存的 ChatWnd 实例
+        chatwnd = self._chatwnd_cache.get(receiver)
+        if chatwnd is None:
+            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
+            self._chatwnd_cache[receiver] = chatwnd
+        # 3) 发送，失败则重建一次
+        try:
+            chatwnd.SendFiles(filepath)
+        except Exception as e:
+            logger.warning(f"缓存的 ChatWnd 发送文件失败({e})，清除缓存重试")
+            self._chatwnd_cache.pop(receiver, None)
+            if not self._ensure_chatwnd(wechat, receiver):
+                logger.error(f"重试失败：{receiver!r} 的独立聊天窗口已不存在")
+                return
+            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
+            self._chatwnd_cache[receiver] = chatwnd
+            chatwnd.SendFiles(filepath)
+
     async def _process_message_segments(self, message_segment, receiver):
         """递归处理消息段，支持多段消息"""
         try:
@@ -484,9 +524,9 @@ class MessageProcessor:
                                 temp_file.write(image_data)
                                 temp_file_path = temp_file.name
 
-                            # 发送图片文件
-                            logger.info(f"调用 wechat.SendFiles 发送图片: {receiver}")
-                            wechat.SendFiles(temp_file_path, receiver)
+                            # 发送图片文件（走缓存 ChatWnd，避免静默失败 + 慢）
+                            logger.info(f"通过缓存实例发送 base64 图片: {receiver}")
+                            self._send_file_cached(wechat, receiver, temp_file_path)
                             logger.info(f"已发送base64图片到微信: {receiver}")
 
                             # 删除临时文件
@@ -503,11 +543,13 @@ class MessageProcessor:
                             logger.info(f"已发送文字内容: {receiver} - {content[:50]}...")
 
                     # 检查是否是图片/表情包路径
-                    elif isinstance(content, str) and (content.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')) or content.startswith('[') and ']' in content):
-                        # 如果是图片路径，使用SendFiles方法
+                    # 注意：不再把 "[xxx]" 格式当图片路径（表情如 [微笑] 会误判），
+                    # 只认以图片扩展名结尾且文件真实存在的路径
+                    elif isinstance(content, str) and content.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                        # 如果是图片路径，使用缓存的 SendFiles 发送
                         if os.path.exists(content):
-                            logger.info(f"调用 wechat.SendFiles 发送图片文件: {receiver} - {content}")
-                            wechat.SendFiles(content, receiver)
+                            logger.info(f"通过缓存实例发送图片文件: {receiver} - {content}")
+                            self._send_file_cached(wechat, receiver, content)
                             logger.info(f"已发送图片到微信: {receiver} - {content}")
                         else:
                             # 如果文件不存在，尝试发送文字内容
@@ -719,11 +761,25 @@ class MessageProcessor:
             
             # 使用Router发送消息
             if self.router:
-                # 用 asyncio.run 替代手动创建/关闭事件循环
-                # （process_message 是同步方法，从监听线程调用，
-                # 需要自己的事件循环来跑 router.send_message 这个协程）
                 message_base = self._dict_to_message_base(message)
-                result = asyncio.run(self.router.send_message(message_base))
+                
+                # router.send_message 复用 Router 的 WebSocket 连接，必须在
+                # Router 所在的事件循环上执行。之前用 asyncio.run 创建新循环，
+                # 跨循环访问 socketio.AsyncClient 会抛
+                # "Future attached to a different loop"（不可靠）。
+                # 改用 run_coroutine_threadsafe 把协程投递到 Router 的循环。
+                router_loop = getattr(self, '_router_loop', None)
+                if router_loop is not None and router_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.router.send_message(message_base),
+                        router_loop
+                    )
+                    # 等待发送完成，超时10秒避免监听线程被永久阻塞
+                    future.result(timeout=10)
+                else:
+                    # Router 循环未就绪，回退到 asyncio.run（首次启动竞态等极端情况）
+                    logger.warning("Router 事件循环未就绪，回退到 asyncio.run")
+                    asyncio.run(self.router.send_message(message_base))
                 
                 return {"success": True, "data": "消息已发送"}
             else:
