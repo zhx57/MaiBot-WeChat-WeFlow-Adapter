@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import logging
 import signal
 import sys
@@ -219,7 +220,6 @@ if __name__ == "__main__":
     
     # 运行主函数
     try:
-        import asyncio
         asyncio.run(main(args))
     except KeyboardInterrupt:
         logger.info("程序被用户中断")

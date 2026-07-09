@@ -2,14 +2,11 @@ import json
 import logging
 import time
 import hashlib
-import requests
 import asyncio
-import websockets
-import threading
 from datetime import datetime
 from config import MAIBOT_API_URL, PLATFORM_ID
 from maim_message import Router, RouteConfig, TargetConfig, MessageBase, BaseMessageInfo, UserInfo, GroupInfo, Seg
-import os # Added for file existence check
+import os
 
 
 class _SendOnlyChatWnd:
@@ -132,9 +129,9 @@ class MessageProcessor:
                 self.send_task = loop.create_task(self._process_send_queue())
                 logger.info("消息发送队列已启动")
                 
-                # 启动Router
+                # 启动Router（run_until_complete 会阻塞直到 Router 停止）
+                logger.info("Router 正在启动...")
                 self.router_task = loop.run_until_complete(self.router.run())
-                logger.info("Router已启动")
         except Exception as e:
             logger.error(f"Router启动失败: {str(e)}")
     
@@ -413,10 +410,6 @@ class MessageProcessor:
     async def _send_to_wechat_sync(self, receiver, content):
         """实际执行发送消息到微信的操作"""
         try:
-            # 使用asyncio在线程池中执行同步操作
-            import asyncio
-            import concurrent.futures
-
             def send_message():
                 try:
                     # 发送线程也需要 COM 初始化（UIA 操作依赖）
@@ -441,7 +434,24 @@ class MessageProcessor:
                     logger.info(f"开始发送到微信: receiver={receiver!r} (type={type(receiver).__name__}), content={str(content)[:80]}")
 
                     # 检查是否是base64编码的图片数据
-                    if isinstance(content, str) and (content.startswith('data:image/') or len(content) > 1000 and content.replace('+', '').replace('/', '').replace('=', '').isalnum()):
+                    # 注意：仅凭"长+字母数字"判断会误判长英文文本。
+                    # 额外要求：长度是4的倍数（base64特征）且无明显空格/换行（base64不含空白）
+                    def _looks_like_base64(s):
+                        if s.startswith('data:image/'):
+                            return True
+                        if len(s) < 1000:
+                            return False
+                        # base64 不含空格、换行等空白字符
+                        if any(c.isspace() for c in s):
+                            return False
+                        # base64 长度必须是4的倍数
+                        if len(s) % 4 != 0:
+                            return False
+                        # 只允许 base64 字符集
+                        import re
+                        return bool(re.match(r'^[A-Za-z0-9+/]+=*$', s))
+
+                    if isinstance(content, str) and _looks_like_base64(content):
                         # 可能是base64编码的图片
                         try:
                             # 尝试解码base64数据
@@ -519,10 +529,10 @@ class MessageProcessor:
                     logger.error(f"错误详情: {traceback.format_exc()}")
                     raise e
 
-            # 在线程池中执行并等待完成
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                await loop.run_in_executor(executor, send_message)
+            # 在默认线程池中执行并等待完成
+            # 之前每次都新建 ThreadPoolExecutor，创建/销毁开销大且可能泄漏线程
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, send_message)
 
         except Exception as e:
             logger.error(f"发送微信消息时发生错误: {str(e)}")
@@ -709,16 +719,11 @@ class MessageProcessor:
             
             # 使用Router发送消息
             if self.router:
-                # 创建新的事件循环
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # 将字典消息转换为MessageBase对象
+                # 用 asyncio.run 替代手动创建/关闭事件循环
+                # （process_message 是同步方法，从监听线程调用，
+                # 需要自己的事件循环来跑 router.send_message 这个协程）
                 message_base = self._dict_to_message_base(message)
-                
-                # 发送消息
-                result = loop.run_until_complete(self.router.send_message(message_base))
-                loop.close()
+                result = asyncio.run(self.router.send_message(message_base))
                 
                 return {"success": True, "data": "消息已发送"}
             else:
