@@ -157,18 +157,33 @@ class WeChatListener:
             logger.warning(f"仍有 {len(self._failed_chats)} 个聊天监听失败: {list(self._failed_chats)}")
 
     def _clear_search_box(self):
-        """清空微信主窗口的搜索框。
+        """彻底清空微信主窗口的搜索框。
 
-        ChatWith 内部用 Ctrl+F 打开搜索框后 SendKeys 输入搜索词，
-        但不会清空已有内容。如果上次 ChatWith 中途被打断（搜索词没被消费），
-        下次重试会在搜索框里追加，导致 '元宝原宝元宝原宝' 搜不到结果。
-        重试前先 Esc 关闭搜索框 + 确保干净。
+        ChatWith 内部用 Ctrl+F 打开搜索框后 B_Search.SendKeys(who) 追加文字，
+        但不会清空已有内容。如果上次 ChatWith 中途被打断，搜索框残留文字，
+        下次重试会追加变成 '元宝原宝元宝原宝' 搜不到结果。
+
+        微信搜索框的 Esc 行为：第一次只关闭搜索结果下拉，文字仍在。
+        必须先聚焦搜索框 → Ctrl+A 全选 → Delete 删除 → Esc 关闭。
+
+        如果微信窗口不存在，_show 会抛异常，这里直接捕获跳过。
         """
         try:
-            # Esc 关闭搜索框（如果开着的话）
+            # 先确保主窗口在前台（窗口不存在会抛异常，直接跳过）
+            self.wx._show()
+            # Esc 先关闭可能打开的搜索结果下拉
             self.wx.UiaAPI.SendKeys('{Esc}', waitTime=0.3)
-        except Exception:
-            pass
+            # Ctrl+F 打开搜索框（如果没打开的话），聚焦到搜索框
+            self.wx.UiaAPI.SendKeys('{Ctrl}f', waitTime=0.5)
+            # Ctrl+A 全选搜索框内容
+            self.wx.B_Search.SendKeys('{Ctrl}a', waitTime=0.3)
+            # Delete 删除选中的文字
+            self.wx.B_Search.SendKeys('{Delete}', waitTime=0.3)
+            # Esc 关闭搜索框
+            self.wx.UiaAPI.SendKeys('{Esc}', waitTime=0.3)
+        except Exception as e:
+            # 窗口不存在或 UIA 操作失败，忽略（ChatWith 内部会再处理）
+            logger.debug(f"清空搜索框跳过: {e}")
 
     def _add_listen_chat(self, chat_name, max_retries=3):
         """添加监听的聊天对象，带重试。
@@ -177,14 +192,21 @@ class WeChatListener:
         单次失败不放弃，重试 max_retries 次，每次间隔递增（1s/2s/3s）。
         成功则加入 self.listen_chats，失败则加入 self._failed_chats 待主循环重试。
         每次重试前清空搜索框，避免搜索词重复累积。
+        每次重试前检查微信窗口是否存活，不存活则跳过（等主循环的重连逻辑处理）。
         """
         import os
         savepic = os.getenv('IMAGE_AUTO_DOWNLOAD', 'true').lower() == 'true'
 
         for attempt in range(1, max_retries + 1):
             try:
+                # 微信窗口不存在时直接跳过本次尝试（不浪费 UIA 超时时间）
+                if not self._is_wechat_alive():
+                    logger.warning(f"微信窗口不存在，跳过 {chat_name} (第{attempt}/{max_retries}次)")
+                    if attempt < max_retries:
+                        time.sleep(attempt)
+                    continue
+
                 # 重试前清空搜索框，避免上次残留的搜索词和本次叠加
-                # （首次也清一下，防止上次运行残留）
                 self._clear_search_box()
 
                 # 尝试打开聊天窗口
@@ -203,6 +225,11 @@ class WeChatListener:
                     logger.warning(f"无法找到聊天对象: {chat_name} (第{attempt}/{max_retries}次)")
             except Exception as e:
                 logger.warning(f"添加监听聊天 {chat_name} 异常 (第{attempt}/{max_retries}次): {str(e)}")
+                # ChatWith 内部可能因 _show 失败留下脏状态，尝试刷新一下
+                try:
+                    self.wx._refresh()
+                except Exception:
+                    pass
 
             # 还有重试机会则等待
             if attempt < max_retries:
@@ -230,6 +257,14 @@ class WeChatListener:
                             self._process_message(chat_name, msg)
         except Exception as e:
             logger.error(f"检查新消息时发生错误: {str(e)}")
+            # 如果 GetListenMessage 持续失败，可能是监听失效，
+            # 把所有监听聊天标记为失败，让 _retry_failed_chats 重新添加
+            err_str = str(e).lower()
+            if any(k in err_str for k in ['not found', '找不到', '不存在', 'none', 'attribute']):
+                logger.warning("监听可能已失效，将重新初始化所有监听聊天")
+                for chat_name in list(self.listen_chats.keys()):
+                    self._failed_chats.add(chat_name)
+                self.listen_chats.clear()
 
     def _is_wechat_alive(self):
         """检测微信主窗口是否还存在。
