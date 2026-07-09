@@ -248,6 +248,17 @@ class MessageProcessor:
                     receiver = self._id_to_name[uid]
                     logger.info(f"通过 user_info.user_id={uid} 反查到昵称: {receiver}")
 
+        # 3) 兜底：用 additional_config.platform_io_target_user_id 反查
+        # 麦麦回复里通常带 additional_config.platform_io_target_user_id（接收者 md5），
+        # 作为 receiver_info 之外的第二道保险，避免因结构差异丢回复
+        if not receiver:
+            additional_config = getattr(message_info, 'additional_config', None)
+            if additional_config:
+                target_uid = getattr(additional_config, 'platform_io_target_user_id', None)
+                if target_uid and target_uid in self._id_to_name:
+                    receiver = self._id_to_name[target_uid]
+                    logger.info(f"通过 additional_config.platform_io_target_user_id={target_uid} 反查到昵称: {receiver}")
+
         return receiver
 
     def _ensure_chatwnd(self, wechat, receiver):
@@ -259,6 +270,10 @@ class MessageProcessor:
         2. 双击会话列表项弹出独立窗口
         （参考 wxauto.AddListenChat 的实现）
         返回 True 表示独立窗口已就绪，False 表示无法弹出。
+
+        注意：双击后独立窗口不会立即出现，需要轮询等待（最多5秒）。
+        之前只 sleep(1) 检查一次，新对象窗口弹出慢时会误判失败，
+        导致第一条回复被丢弃（表现为"第一句不回，发两句只回第二句"）。
         """
         from wxauto.utils import FindWindow
         if FindWindow(name=receiver, classname='ChatWnd'):
@@ -267,13 +282,14 @@ class MessageProcessor:
             logger.info(f"{receiver!r} 无独立聊天窗口，尝试弹出独立窗口")
             wechat.ChatWith(receiver)
             wechat.SessionBox.ListItemControl(RegexName=receiver).DoubleClick(simulateMove=False)
+            # 轮询等待独立窗口出现，最多5秒（新对象窗口弹出可能需要2-3秒）
             import time
-            time.sleep(1)  # 等待独立窗口创建
-            ok = FindWindow(name=receiver, classname='ChatWnd')
-            if ok:
-                logger.info(f"✅ 已弹出 {receiver!r} 的独立聊天窗口")
-                return True
-            logger.error(f"❌ 弹出 {receiver!r} 独立窗口失败")
+            for i in range(10):
+                time.sleep(0.5)
+                if FindWindow(name=receiver, classname='ChatWnd'):
+                    logger.info(f"✅ 已弹出 {receiver!r} 的独立聊天窗口（等待{(i+1)*0.5:.1f}s）")
+                    return True
+            logger.error(f"❌ 弹出 {receiver!r} 独立窗口失败（等待5s未出现）")
             return False
         except Exception as e:
             logger.error(f"❌ 弹出 {receiver!r} 独立窗口异常: {e}")
