@@ -240,15 +240,22 @@ class MessageProcessor:
             # 使用asyncio在线程池中执行同步操作
             import asyncio
             import concurrent.futures
-            
+
             def send_message():
                 try:
-                    from wxauto import WeChat
+                    # 复用 mq_Consumer.py 里的全局 wx 实例，避免每次发送都新建
+                    # WeChat() 实例（新建会重复做 UIA 查找窗口、COM 初始化，
+                    # 多实例同时操作同一微信窗口会冲突导致发送失败）
+                    from mq_Consumer import wx as wechat
                     import base64
                     import tempfile
                     import os
-                    wechat = WeChat()
-                    
+
+                    if wechat is None:
+                        raise RuntimeError("全局 wxauto.WeChat 实例未初始化")
+
+                    logger.info(f"开始发送到微信: receiver={receiver}, content={str(content)[:80]}")
+
                     # 检查是否是base64编码的图片数据
                     if isinstance(content, str) and (content.startswith('data:image/') or len(content) > 1000 and content.replace('+', '').replace('/', '').replace('=', '').isalnum()):
                         # 可能是base64编码的图片
@@ -277,52 +284,59 @@ class MessageProcessor:
                                 # 检查PNG文件头
                                 elif image_data.startswith(b'\x89PNG'):
                                     file_extension = '.png'
-                            
+
                             # 创建临时文件，使用正确的扩展名
                             with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
                                 temp_file.write(image_data)
                                 temp_file_path = temp_file.name
-                            
+
                             # 发送图片文件
+                            logger.info(f"调用 wechat.SendFiles 发送图片: {receiver}")
                             wechat.SendFiles(temp_file_path, receiver)
                             logger.info(f"已发送base64图片到微信: {receiver}")
-                            
+
                             # 删除临时文件
                             try:
                                 os.unlink(temp_file_path)
                             except:
                                 pass
-                                
+
                         except Exception as e:
                             logger.error(f"处理base64图片失败: {str(e)}")
                             # 如果base64解码失败，尝试作为文字发送
+                            logger.info(f"base64解码失败，改发文字: {receiver}")
                             wechat.SendMsg(content, receiver)
-                            logger.info(f"base64解码失败，发送文字内容: {receiver} - {content[:50]}...")
-                    
+                            logger.info(f"已发送文字内容: {receiver} - {content[:50]}...")
+
                     # 检查是否是图片/表情包路径
                     elif isinstance(content, str) and (content.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')) or content.startswith('[') and ']' in content):
                         # 如果是图片路径，使用SendFiles方法
                         if os.path.exists(content):
+                            logger.info(f"调用 wechat.SendFiles 发送图片文件: {receiver} - {content}")
                             wechat.SendFiles(content, receiver)
                             logger.info(f"已发送图片到微信: {receiver} - {content}")
                         else:
                             # 如果文件不存在，尝试发送文字内容
+                            logger.info(f"图片文件不存在，改发文字: {receiver}")
                             wechat.SendMsg(content, receiver)
-                            logger.info(f"图片文件不存在，发送文字内容: {receiver} - {content}")
+                            logger.info(f"已发送文字内容: {receiver} - {content}")
                     else:
                         # 普通文字消息
+                        logger.info(f"调用 wechat.SendMsg: receiver={receiver}")
                         wechat.SendMsg(content, receiver)
-                        logger.info(f"已发送文字消息到微信: {receiver} - {content}")
-                        
+                        logger.info(f"✅ 已发送文字消息到微信: {receiver} - {content}")
+
                 except Exception as e:
-                    logger.error(f"发送微信消息失败: {str(e)}")
+                    logger.error(f"❌ 发送微信消息失败: {str(e)}")
+                    import traceback
+                    logger.error(f"错误详情: {traceback.format_exc()}")
                     raise e
-            
+
             # 在线程池中执行并等待完成
             loop = asyncio.get_event_loop()
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 await loop.run_in_executor(executor, send_message)
-            
+
         except Exception as e:
             logger.error(f"发送微信消息时发生错误: {str(e)}")
     
