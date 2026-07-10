@@ -33,6 +33,8 @@ from wx_Listener import (
 logger = logging.getLogger(__name__)
 exit_logger = logging.getLogger("wemai.exit")
 stop_event = threading.Event()
+UI_HEARTBEAT_IDLE_TIMEOUT = 30
+UI_HEARTBEAT_BUSY_TIMEOUT = 60
 _runtime = {"started": time.monotonic(), "state": None, "processor": None,
             "ui_thread": None, "shutdown_reason": None}
 
@@ -106,10 +108,14 @@ def log_exit(reason, exc=None):
         "last_heartbeat": state.get("heartbeat_at"),
         "heartbeat_age_seconds": round(heartbeat_age, 3) if heartbeat_age is not None else None,
         "ui_command_active": getattr(listener, "_command_active", None),
+        "ui_recovery_active": getattr(listener, "_recovery_active", None),
         "ui_reconnecting": getattr(listener, "_reconnecting", None),
         "ui_command_age_seconds": (
             round(now - listener._command_started, 3)
             if listener and getattr(listener, "_command_started", None) else None),
+        "ui_recovery_age_seconds": (
+            round(now - listener._recovery_started, 3)
+            if listener and getattr(listener, "_recovery_started", None) else None),
         "listen_chat_count": len(getattr(listener, "listen_chats", {})) if listener else None,
         "failed_chat_count": len(getattr(listener, "_failed_chats", {})) if listener else None,
         "router_connected": router_connected,
@@ -238,12 +244,16 @@ async def main(args):
             heartbeat_age = time.monotonic() - state["heartbeat"]
             listener = state["listener"]
             command_active = bool(listener and listener._command_active)
-            ui_busy = command_active or bool(listener and listener._reconnecting)
-            heartbeat_limit = 300 if ui_busy else 120
+            recovery_active = bool(listener and listener._recovery_active)
+            ui_busy = (command_active or recovery_active
+                       or bool(listener and listener._reconnecting))
+            heartbeat_limit = (UI_HEARTBEAT_BUSY_TIMEOUT if ui_busy
+                               else UI_HEARTBEAT_IDLE_TIMEOUT)
             if heartbeat_age > heartbeat_limit:
                 stop_event.set()
                 reason = (f"UI worker heartbeat 超过 {heartbeat_limit} 秒未更新 "
-                          f"command_active={command_active}")
+                          f"command_active={command_active} "
+                          f"recovery_active={recovery_active}")
                 log_exit(reason)
                 raise RuntimeError(reason)
             try:

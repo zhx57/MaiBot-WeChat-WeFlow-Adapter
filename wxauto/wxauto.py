@@ -20,6 +20,27 @@ try:
 except:
     from typing_extensions import Literal
 
+
+def _find_chat_windows(who):
+    """Locate an exact ChatWnd natively, falling back to a UIA root scan."""
+    key = normalize_chat_name(who)
+    try:
+        hwnd = win32gui.FindWindow('ChatWnd', who)
+        if hwnd and win32gui.IsWindow(hwnd):
+            window = uia.ControlFromHandle(hwnd)
+            if (window is not None
+                    and getattr(window, 'ClassName', '') == 'ChatWnd'
+                    and normalize_chat_name(getattr(window, 'Name', '')) == key):
+                return [window]
+    except Exception:
+        wxlog.debug(f'原生窗口快速定位失败：{who}', exc_info=True)
+    return [
+        window for window in uia.GetRootControl().GetChildren()
+        if getattr(window, 'ClassName', '') == 'ChatWnd'
+        and normalize_chat_name(getattr(window, 'Name', '')) == key
+    ]
+
+
 class WeChat(WeChatBase):
     VERSION: str = '3.9.11.17'
     lastmsgid: str = None
@@ -576,9 +597,7 @@ class WeChat(WeChatBase):
             savevoice (bool, optional): 是否自动保存聊天语音，只针对该聊天对象有效
         """
         key = normalize_chat_name(who)
-        windows = [window for window in uia.GetRootControl().GetChildren()
-                   if getattr(window, 'ClassName', '') == 'ChatWnd'
-                   and normalize_chat_name(getattr(window, 'Name', '')) == key]
+        windows = _find_chat_windows(who)
         if len(windows) > 1:
             raise TargetNotFoundError(f'存在多个规范化同名窗口：raw={who!r}, normalized={key!r}')
         window = windows[0] if windows else None
@@ -605,9 +624,7 @@ class WeChat(WeChatBase):
             item.DoubleClick(simulateMove=False)
             deadline = time.time() + 5
             while time.time() < deadline:
-                windows = [candidate for candidate in uia.GetRootControl().GetChildren()
-                           if getattr(candidate, 'ClassName', '') == 'ChatWnd'
-                           and normalize_chat_name(getattr(candidate, 'Name', '')) == key]
+                windows = _find_chat_windows(who)
                 if len(windows) == 1:
                     window = windows[0]
                     break

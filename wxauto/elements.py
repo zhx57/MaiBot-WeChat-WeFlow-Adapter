@@ -194,6 +194,9 @@ class ChatWnd(WeChatBase):
         self.chat_key = normalize_chat_name(who)
         self.language = language
         self.usedmsgid = []
+        self._baseline_pending = True
+        self._baseline_candidate = None
+        self._baseline_stable_polls = 0
         self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=self.uia_name)
         self.editbox = self.UiaAPI.EditControl()
         self.C_MsgList = self.UiaAPI.ListControl()
@@ -210,9 +213,12 @@ class ChatWnd(WeChatBase):
         self.editbox = self.UiaAPI.EditControl()
         self.C_MsgList = self.UiaAPI.ListControl()
         self.HWND = hwnd
-        # RuntimeIds belong to the old UIA tree. Starting with an empty set makes
-        # the first poll establish a fresh baseline instead of replaying history.
+        # RuntimeIds belong to the old UIA tree. Require two equal UIA snapshots so
+        # a window that is still loading cannot establish an empty baseline.
         self.usedmsgid = []
+        self._baseline_pending = True
+        self._baseline_candidate = None
+        self._baseline_stable_polls = 0
         return self
 
     def __repr__(self) -> str:
@@ -365,15 +371,32 @@ class ChatWnd(WeChatBase):
             list: 新聊天记录信息
         '''
         wxlog.debug(f"获取新聊天记录：{self.who}")
-        if not self.usedmsgid:
-            self.usedmsgid = [i[-1] for i in self.GetAllMessage()]
-            return []
         MsgItems = self.C_MsgList.GetChildren()
-        NewMsgItems = [i for i in MsgItems if ''.join([str(i) for i in i.GetRuntimeId()]) not in self.usedmsgid]
+        msgids = [
+            ''.join([str(part) for part in item.GetRuntimeId()])
+            for item in MsgItems
+            if item.ControlTypeName == 'ListItemControl'
+        ]
+        if getattr(self, '_baseline_pending', not bool(self.usedmsgid)):
+            if msgids == getattr(self, '_baseline_candidate', None):
+                self._baseline_stable_polls += 1
+            else:
+                self._baseline_candidate = msgids
+                self._baseline_stable_polls = 1
+            if self._baseline_stable_polls >= 2:
+                self.usedmsgid = msgids
+                self._baseline_pending = False
+                self._baseline_candidate = None
+            return []
+        NewMsgItems = [
+            item for item in MsgItems
+            if item.ControlTypeName == 'ListItemControl'
+            and ''.join([str(part) for part in item.GetRuntimeId()]) not in self.usedmsgid
+        ]
         if not NewMsgItems:
             return []
         newmsgs = self._getmsgs(NewMsgItems, savepic, savefile, savevoice)
-        self.usedmsgid = [i[-1] for i in self._getmsgs(MsgItems)]
+        self.usedmsgid = msgids
         # if newmsgs[0].type == 'sys' and newmsgs[0].content == self._lang('查看更多消息'):
         #     newmsgs = newmsgs[1:]
         return newmsgs

@@ -54,6 +54,15 @@ _IMAGE_MAGIC = {
 }
 
 
+class OutboundDeliveryError(RuntimeError):
+    """Final send failure retaining whether another delivery attempt is safe."""
+
+    def __init__(self, cause):
+        super().__init__("微信消息发送重试耗尽")
+        self.retry_safe = getattr(cause, "retry_safe", True)
+        self.command_future = getattr(cause, "command_future", None)
+
+
 class MessageProcessor:
     def __init__(self, platform=PLATFORM_ID, ui_submit=None, inbound_enabled=True,
                  outbound_enabled=True):
@@ -69,6 +78,7 @@ class MessageProcessor:
         self._send_task = None
         self._inbound_task = None
         self._health_task = None
+        self._cleanup_tasks = set()
         self._stop_requested = threading.Event()
         self._stopping = threading.Event()
         self._router_disconnect_since = None
@@ -273,7 +283,7 @@ class MessageProcessor:
                 if attempt < 3:
                     await asyncio.sleep(attempt)
         logger.error("消息进入死信 target=%s type=%s error=%s", receiver, kind, last_error)
-        raise RuntimeError("微信消息发送重试耗尽") from last_error
+        raise OutboundDeliveryError(last_error) from last_error
 
     async def _handle_maibot_response(self, message):
         if not self.outbound_enabled:
@@ -313,10 +323,17 @@ class MessageProcessor:
             return
         if seg_type == "image":
             path, temporary = self._prepare_image(data)
+            deferred_cleanup = False
             try:
                 await self._queue_outbound(receiver, "image", path)
+            except Exception as exc:
+                command_future = getattr(exc, "command_future", None)
+                if temporary and command_future is not None:
+                    self._defer_temporary_cleanup(path, command_future)
+                    deferred_cleanup = True
+                raise
             finally:
-                if temporary:
+                if temporary and not deferred_cleanup:
                     try:
                         os.unlink(path)
                     except OSError:
@@ -336,6 +353,22 @@ class MessageProcessor:
         text = self._text(data)
         if text:
             await self._queue_outbound(receiver, "text", text)
+
+    def _defer_temporary_cleanup(self, path, command_future):
+        task = asyncio.create_task(self._cleanup_after_ui_command(path, command_future))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    @staticmethod
+    async def _cleanup_after_ui_command(path, command_future):
+        try:
+            await asyncio.wrap_future(command_future)
+        except BaseException:
+            pass
+        try:
+            await asyncio.to_thread(os.unlink, path)
+        except OSError:
+            logger.warning("延迟临时图片清理失败 path=%s", path, exc_info=True)
 
     async def _queue_outbound(self, receiver, kind, data):
         completion = asyncio.get_running_loop().create_future()

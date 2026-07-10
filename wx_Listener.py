@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import re
 import threading
 import time
 import uuid
@@ -23,7 +24,11 @@ from config import (
 logger = logging.getLogger(__name__)
 
 CHAT_RETRY_MAX_DELAY = 30
-CHAT_RETRY_DISABLE_AFTER = 8
+CHAT_RETRY_CRITICAL_AFTER = 8
+LISTENER_HEALTH_INTERVAL = 5
+CHAT_TITLE_REFRESH_INTERVAL = 30
+MESSAGE_FAILURE_REBUILD_AFTER = 3
+_DYNAMIC_TITLE_SUFFIX = re.compile(r"\s*(?:\(\d+\)|（\d+）|\[\d+\])\s*$")
 
 
 @dataclass
@@ -61,10 +66,11 @@ class UICommand:
 
 
 class UICommandTimeout(TimeoutError):
-    def __init__(self, command_id, retry_safe):
+    def __init__(self, command_id, retry_safe, command_future=None):
         super().__init__(f"UI 命令超时 id={command_id} retry_safe={retry_safe}")
         self.command_id = command_id
         self.retry_safe = retry_safe
+        self.command_future = command_future
 
 
 @dataclass
@@ -91,11 +97,20 @@ class UICommandQueue:
         try:
             return command.future.result(timeout=timeout)
         except FutureTimeoutError as exc:
+            if command.future.done():
+                return command.future.result()
             retry_safe = command.cancel_if_pending()
             if not retry_safe:
-                # Execution already started. Its outcome must be observed before the
-                # caller may release media or decide whether a retry is safe.
-                return command.future.result()
+                try:
+                    # Total caller wait is bounded at three times the requested timeout.
+                    return command.future.result(timeout=max(float(timeout) * 2, 0))
+                except FutureTimeoutError as started_exc:
+                    if command.future.done():
+                        return command.future.result()
+                    raise UICommandTimeout(
+                        command.command_id, retry_safe=False,
+                        command_future=command.future,
+                    ) from started_exc
             raise UICommandTimeout(command.command_id, retry_safe) from exc
 
     def get_nowait(self):
@@ -132,8 +147,14 @@ class WeChatListener:
                            if item.get("type") in {"private", "group"}}
         self._failed_chats = {}
         self._chatwnd_cache = {}
+        self._last_health_check = None
+        self._title_check_at = {}
+        self._message_poll_cursor = 0
+        self._message_failures = {}
         self._command_active = False
         self._command_started = None
+        self._recovery_active = False
+        self._recovery_started = None
         self._reconnecting = False
         self.running = False
         logger.info("微信监听器初始化成功 account=%s", self.wx.nickname)
@@ -165,14 +186,18 @@ class WeChatListener:
     def start_listening(self):
         self._assert_ui_thread()
         self.running = True
-        time.sleep(1)
         names = [item["name"] for item in self.target_specs]
         if not names and WX_LISTEN_ALL_IF_EMPTY:
             names = [name for name in self.wx.GetSessionList(reset=True)
                      if name not in WX_EXCLUDED_CHATS]
         self._desired_chats = {normalize_chat_name(name): name for name in names}
-        for name in names:
-            self._add_listen_chat(name)
+        if names:
+            retry_at = time.monotonic()
+            self._failed_chats = {
+                normalize_chat_name(name): ChatRecoveryState(
+                    name=name, next_retry=retry_at, reason="等待初始化监听")
+                for name in names
+            }
         if not names:
             logger.info("最终有效配置为零监听；仅处理 MaiBot 到微信命令")
 
@@ -184,11 +209,13 @@ class WeChatListener:
         wait_for_command = getattr(self.commands, "wait", None)
         while self.running and not (self.stop_event and self.stop_event.is_set()):
             self._touch_heartbeat()
-            self._drain_commands(limit=20)
+            self._drain_commands(limit=1)
             now = time.monotonic()
+            use_poll_sleep = False
             if now - last_alive_check >= 5:
                 last_alive_check = now
                 if not self._is_wechat_alive():
+                    use_poll_sleep = True
                     alive_check_failures += 1
                     logger.warning("微信窗口探测失败 count=%d/3", alive_check_failures)
                     if alive_check_failures >= 3 and lost_since is None:
@@ -196,37 +223,39 @@ class WeChatListener:
                         logger.error("连续探测不到微信窗口，进入恢复模式")
                     if lost_since is not None and now - lost_since > 600:
                         raise RuntimeError("微信窗口丢失超过 600 秒")
-                    time.sleep(0.2)
-                    continue
-                alive_check_failures = 0
-                if lost_since is not None:
+                else:
+                    alive_check_failures = 0
+                if lost_since is not None and not use_poll_sleep:
                     if now - lost_since > 600:
                         raise RuntimeError("微信窗口丢失超过 600 秒")
                     if now < next_reconnect:
-                        continue
-                    self._touch_heartbeat()
-                    self._reconnecting = True
-                    try:
-                        reconnected = self._reconnect_wechat()
-                    finally:
-                        self._reconnecting = False
                         self._touch_heartbeat()
-                    if reconnected:
-                        logger.info("微信窗口重连成功 attempts=%d", reconnect_attempts + 1)
-                        lost_since = None
-                        reconnect_attempts = 0
-                        next_reconnect = 0
                     else:
-                        reconnect_attempts += 1
-                        delay = min(30, 2 ** min(reconnect_attempts, 5))
-                        next_reconnect = now + delay
-                        logger.warning("微信窗口重连失败，将在 %d 秒后重试 attempt=%d",
-                                       delay, reconnect_attempts)
-                        continue
+                        self._touch_heartbeat()
+                        self._reconnecting = True
+                        try:
+                            reconnected = self._reconnect_wechat()
+                        finally:
+                            self._reconnecting = False
+                            self._touch_heartbeat()
+                        if reconnected:
+                            logger.info("微信窗口重连成功 attempts=%d", reconnect_attempts + 1)
+                            lost_since = None
+                            reconnect_attempts = 0
+                            next_reconnect = 0
+                        else:
+                            use_poll_sleep = True
+                            reconnect_attempts += 1
+                            delay = min(30, 2 ** min(reconnect_attempts, 5))
+                            next_reconnect = now + delay
+                            logger.warning("微信窗口重连失败，将在 %d 秒后重试 attempt=%d",
+                                           delay, reconnect_attempts)
             self._check_listener_health()
             self._check_new_messages()
             self._retry_failed_chats()
-            if wait_for_command:
+            if use_poll_sleep:
+                time.sleep(0.2)
+            elif wait_for_command:
                 wait_for_command(0.2)
             else:
                 time.sleep(0.2)
@@ -243,9 +272,13 @@ class WeChatListener:
         if self.heartbeat:
             self.heartbeat()
 
-    def _drain_commands(self, limit):
+    def _drain_commands(self, limit=1):
         self._assert_ui_thread()
-        for _ in range(limit):
+        # A synchronous wxauto send may consume its whole internal timeout. Never
+        # amplify that delay by executing a batch before polling inbound messages.
+        for _ in range(min(max(int(limit), 0), 1)):
+            if self.stop_event and self.stop_event.is_set():
+                return
             try:
                 command = self.commands.get_nowait()
             except queue.Empty:
@@ -312,9 +345,7 @@ class WeChatListener:
         from wxauto.elements import ChatWnd
         from wxauto import uiautomation as uia
 
-        windows = [window for window in uia.GetRootControl().GetChildren()
-                   if getattr(window, "ClassName", "") == "ChatWnd"
-                   and normalize_chat_name(getattr(window, "Name", "")) == key]
+        windows = self._find_chat_windows(receiver, uia)
         if len(windows) > 1:
             raise RuntimeError(f"存在多个规范化同名窗口: raw={receiver!r} normalized={key!r}")
         if not windows:
@@ -339,9 +370,7 @@ class WeChatListener:
             matches[0].DoubleClick(simulateMove=False)
             deadline = time.time() + 5
             while time.time() < deadline:
-                windows = [window for window in uia.GetRootControl().GetChildren()
-                           if getattr(window, "ClassName", "") == "ChatWnd"
-                           and normalize_chat_name(getattr(window, "Name", "")) == key]
+                windows = self._find_chat_windows(receiver, uia)
                 if len(windows) == 1:
                     break
                 time.sleep(0.03)
@@ -360,14 +389,33 @@ class WeChatListener:
         return chat
 
     @staticmethod
+    def _find_chat_windows(name, uia):
+        """Use the native exact-title lookup before the expensive UIA root scan."""
+        key = normalize_chat_name(name)
+        try:
+            import win32gui
+
+            hwnd = win32gui.FindWindow("ChatWnd", name)
+            if hwnd and win32gui.IsWindow(hwnd):
+                window = uia.ControlFromHandle(hwnd)
+                if (window is not None
+                        and getattr(window, "ClassName", "") == "ChatWnd"
+                        and normalize_chat_name(getattr(window, "Name", "")) == key):
+                    return [window]
+        except Exception:
+            logger.debug("原生窗口快速定位失败 chat=%s", name, exc_info=True)
+        return [
+            window for window in uia.GetRootControl().GetChildren()
+            if getattr(window, "ClassName", "") == "ChatWnd"
+            and normalize_chat_name(getattr(window, "Name", "")) == key
+        ]
+
+    @staticmethod
     def _chatwnd_is_alive(chat):
         try:
             import win32gui
 
             hwnd = getattr(chat, "HWND", None)
-            if not hwnd:
-                hwnd = win32gui.FindWindow("ChatWnd", getattr(chat, "uia_name", None))
-                chat.HWND = hwnd
             if not hwnd or not win32gui.IsWindow(hwnd):
                 return False
             get_class_name = getattr(win32gui, "GetClassName", None)
@@ -385,7 +433,7 @@ class WeChatListener:
         self._desired_chats.setdefault(key, name)
         self._failed_chats.pop(key, None)
 
-    def _add_listen_chat(self, name, max_retries=3):
+    def _add_listen_chat(self, name, max_retries=1):
         self._assert_ui_thread()
         key = normalize_chat_name(name)
         self._desired_chats.setdefault(key, name)
@@ -393,12 +441,10 @@ class WeChatListener:
         for attempt in range(1, max_retries + 1):
             try:
                 self._touch_heartbeat()
-                self._clear_search_box()
                 self.wx.AddListenChat(name, savepic=IMAGE_AUTO_DOWNLOAD,
                                       savefile=False, savevoice=False)
                 chat = self.wx.listen.get(key)
-                if (chat is None or not self._chatwnd_is_alive(chat)
-                        or not chat.UiaAPI.Exists(maxSearchSeconds=2)):
+                if chat is None or not self._chatwnd_is_alive(chat):
                     raise RuntimeError("AddListenChat 未创建有效窗口")
                 if not chat_names_equal(getattr(chat, "who", None), name):
                     raise RuntimeError(
@@ -414,9 +460,11 @@ class WeChatListener:
                 last_error = exc
                 logger.warning("添加监听失败 chat=%s attempt=%d/%d: %s",
                                name, attempt, max_retries, exc)
-                self._remove_listen(name)
+                self._remove_listen(name, key=key, close=False)
                 if attempt < max_retries:
                     time.sleep(attempt)
+            finally:
+                self._touch_heartbeat()
         self._schedule_chat_retry(key, name, last_error)
         return False
 
@@ -436,11 +484,23 @@ class WeChatListener:
         return None
 
     def _check_new_messages(self):
+        keys = list(getattr(self, "listen_chats", {}))
+        if not keys or not getattr(self, "wx", None):
+            return
+        cursor = getattr(self, "_message_poll_cursor", 0)
+        selected_key = keys[cursor % len(keys)]
+        self._message_poll_cursor = cursor + 1
         try:
-            all_messages = self.wx.GetListenMessage() or {}
+            polled = self.wx.GetListenMessage(selected_key) or []
             for key, exc in getattr(self.wx, "listen_errors", {}).items():
                 self._mark_chat_failed(key, f"读取消息失败: {exc}")
-            for chat, messages in all_messages.items():
+                getattr(self, "_message_failures", {}).pop(key, None)
+            if isinstance(polled, dict):
+                message_batches = polled.items()
+            else:
+                chat = getattr(self.wx, "listen", {}).get(selected_key)
+                message_batches = ((chat, polled),) if chat is not None else ()
+            for chat, messages in message_batches:
                 key = normalize_chat_name(chat.who)
                 configured_name = self.listen_chats.get(key)
                 if configured_name is None:
@@ -452,9 +512,20 @@ class WeChatListener:
                     except Exception:
                         logger.exception("处理微信消息失败，已隔离 chat=%s", configured_name)
             self._msg_fail_count = 0
-        except Exception:
+            getattr(self, "_message_failures", {}).pop(selected_key, None)
+        except Exception as exc:
             self._msg_fail_count = getattr(self, "_msg_fail_count", 0) + 1
-            logger.exception("检查微信消息失败 count=%d", self._msg_fail_count)
+            failures = getattr(self, "_message_failures", None)
+            if failures is None:
+                failures = self._message_failures = {}
+            failures[selected_key] = failures.get(selected_key, 0) + 1
+            count = failures[selected_key]
+            logger.exception("检查微信消息失败 chat=%s count=%d/%d",
+                             selected_key, count, MESSAGE_FAILURE_REBUILD_AFTER)
+            if count >= MESSAGE_FAILURE_REBUILD_AFTER:
+                logger.error("读取消息连续失败，重建单个监听 chat=%s", selected_key)
+                failures.pop(selected_key, None)
+                self._mark_chat_failed(selected_key, f"连续读取消息失败: {exc}")
 
     def _process_message(self, chat_name, message):
         key = normalize_chat_name(chat_name)
@@ -480,10 +551,22 @@ class WeChatListener:
     def _retry_failed_chats(self):
         now = time.monotonic()
         for key, state in list(self._failed_chats.items()):
-            if state.disabled or now < state.next_retry:
+            if state.disabled:
+                logger.warning("恢复遗留的 disabled 监听状态 chat=%s", state.name)
+                state.disabled = False
+            if now < state.next_retry:
                 continue
             logger.info("重试恢复监听 chat=%s attempt=%d", state.name, state.failures + 1)
-            self._add_listen_chat(state.name, max_retries=1)
+            self._recovery_active = True
+            self._recovery_started = time.monotonic()
+            self._touch_heartbeat()
+            try:
+                self._add_listen_chat(state.name, max_retries=1)
+            finally:
+                self._touch_heartbeat()
+                self._recovery_active = False
+                self._recovery_started = None
+            return
 
     def _schedule_chat_retry(self, key, name, error):
         state = self._failed_chats.get(key)
@@ -493,13 +576,12 @@ class WeChatListener:
         state.name = name
         state.failures += 1
         state.reason = str(error or "未知错误")
-        if state.failures >= CHAT_RETRY_DISABLE_AFTER:
-            state.disabled = True
-            state.next_retry = float("inf")
-            logger.error("监听连续恢复失败，已停止自动重试 chat=%s failures=%d reason=%s",
+        if (state.failures >= CHAT_RETRY_CRITICAL_AFTER
+                and (state.failures == CHAT_RETRY_CRITICAL_AFTER
+                     or state.failures % 10 == 0)):
+            logger.error("监听持续恢复失败，但仍会自动重试 chat=%s failures=%d reason=%s",
                          name, state.failures, state.reason)
-            return
-        delay = min(CHAT_RETRY_MAX_DELAY, 2 ** max(0, state.failures - 1))
+        delay = min(CHAT_RETRY_MAX_DELAY, 2 ** min(max(0, state.failures - 1), 5))
         state.next_retry = time.monotonic() + delay
         logger.warning("监听恢复失败，将在 %d 秒后重试 chat=%s failures=%d reason=%s",
                        delay, name, state.failures, state.reason)
@@ -514,24 +596,48 @@ class WeChatListener:
             logger.warning("监听窗口失效，等待单独重建 chat=%s reason=%s", name, reason)
         else:
             state.reason = reason
-        self._remove_listen(name)
+        self._discard_listen_state(key)
 
     def _check_listener_health(self):
         if not getattr(self, "wx", None):
             return
+        now = time.monotonic()
+        last_check = getattr(self, "_last_health_check", None)
+        if last_check is not None and now - last_check < LISTENER_HEALTH_INTERVAL:
+            return
+        self._last_health_check = now
+        invalid = []
         for key, name in list(getattr(self, "listen_chats", {}).items()):
             chat = getattr(self.wx, "listen", {}).get(key)
             if chat is None or not self._chatwnd_is_alive(chat):
-                self._mark_chat_failed(key, "HWND 已失效或监听对象丢失")
+                invalid.append(key)
                 continue
             self._chatwnd_cache[key] = chat
             self._refresh_chat_title(key, chat)
+        for key in invalid:
+            self._mark_chat_failed(key, "HWND 已失效或监听对象丢失")
+
+        registered = set(getattr(self, "listen_chats", {}))
+        for key in set(getattr(self.wx, "listen", {})) - registered:
+            if key in getattr(self, "_desired_chats", {}):
+                self._mark_chat_failed(key, "wx.listen 存在未注册残留对象")
+            else:
+                logger.warning("清理 wx.listen 多余对象 normalized=%r", key)
+                self._discard_listen_state(key)
         for key, name in list(getattr(self, "_desired_chats", {}).items()):
             if key not in self.listen_chats and key not in self._failed_chats:
                 self._failed_chats[key] = ChatRecoveryState(
                     name=name, next_retry=time.monotonic(), reason="监听对象缺失")
 
     def _refresh_chat_title(self, key, chat):
+        now = time.monotonic()
+        title_checks = getattr(self, "_title_check_at", None)
+        if title_checks is None:
+            title_checks = self._title_check_at = {}
+        last_check = title_checks.get(key)
+        if last_check is not None and now - last_check < CHAT_TITLE_REFRESH_INTERVAL:
+            return
+        title_checks[key] = now
         try:
             import win32gui
 
@@ -540,7 +646,10 @@ class WeChatListener:
             return
         if not actual_name or actual_name == getattr(chat, "uia_name", None):
             return
-        new_key = normalize_chat_name(actual_name)
+        stable_name = _DYNAMIC_TITLE_SUFFIX.sub("", actual_name).strip()
+        new_key = normalize_chat_name(stable_name)
+        if not new_key or new_key == key:
+            return
         if new_key != key and (new_key in self.listen_chats or new_key in self.wx.listen):
             logger.error("聊天窗口改名后与现有监听冲突 old=%s new=%s", key, new_key)
             return
@@ -549,31 +658,22 @@ class WeChatListener:
         self.wx.listen.pop(key, None)
         self.listen_chats.pop(key, None)
         self._chatwnd_cache.pop(key, None)
-        desired_name = self._desired_chats.pop(key, actual_name)
+        desired_name = self._desired_chats.pop(key, stable_name)
+        getattr(self, "_message_failures", {}).pop(key, None)
+        self._title_check_at.pop(key, None)
         if hasattr(chat, "Rebind"):
-            chat.Rebind(actual_name, chat.HWND)
+            chat.Rebind(stable_name, chat.HWND)
         else:
-            chat.uia_name = actual_name
+            chat.uia_name = stable_name
             chat.usedmsgid = []
-        chat.who = actual_name
+        chat.who = stable_name
         chat.chat_key = new_key
-        self._desired_chats[new_key] = actual_name
+        self._desired_chats[new_key] = stable_name
         if old_type:
             self.chat_types[new_key] = old_type
-        self._activate_listen_chat(new_key, actual_name, chat)
+        self._activate_listen_chat(new_key, stable_name, chat)
         logger.warning("监听聊天标题已更新并重新绑定 old=%s new=%s configured=%s",
                        key, new_key, desired_name)
-
-    def _clear_search_box(self):
-        try:
-            self.wx._show()
-            self.wx.UiaAPI.SendKeys("{Esc}", waitTime=0.1)
-            self.wx.UiaAPI.SendKeys("{Ctrl}f", waitTime=0.2)
-            self.wx.B_Search.SendKeys("{Ctrl}a", waitTime=0.1)
-            self.wx.B_Search.SendKeys("{Delete}", waitTime=0.1)
-            self.wx.UiaAPI.SendKeys("{Esc}", waitTime=0.1)
-        except Exception:
-            logger.debug("清理微信搜索框失败", exc_info=True)
 
     @staticmethod
     def _is_wechat_alive():
@@ -583,32 +683,36 @@ class WeChatListener:
         except Exception:
             return False
 
-    def _remove_listen(self, name):
-        key = normalize_chat_name(name)
-        chat = self.wx.listen.get(key)
-        if chat:
+    def _discard_listen_state(self, key):
+        if getattr(self, "wx", None):
+            getattr(self.wx, "listen", {}).pop(key, None)
+        getattr(self, "listen_chats", {}).pop(key, None)
+        getattr(self, "_chatwnd_cache", {}).pop(key, None)
+        getattr(self, "_title_check_at", {}).pop(key, None)
+        getattr(self, "_message_failures", {}).pop(key, None)
+
+    def _remove_listen(self, name, key=None, close=True):
+        key = key or normalize_chat_name(name)
+        chat = getattr(self.wx, "listen", {}).pop(key, None)
+        if chat and close:
             try:
                 chat.Close()
             except Exception:
                 logger.debug("关闭旧监听窗口失败 chat=%s", name, exc_info=True)
-        try:
-            self.wx.RemoveListenChat(name)
-        except Exception:
-            logger.warning("移除监听窗口失败 chat=%s；本地状态仍将清理", name,
-                           exc_info=True)
-        finally:
-            self.listen_chats.pop(key, None)
-            self._chatwnd_cache.pop(key, None)
+        self._discard_listen_state(key)
 
     def _cleanup_listeners(self):
-        for name in list(getattr(self.wx, "listen", {})):
-            self._remove_listen(name)
+        for key in list(getattr(self.wx, "listen", {})):
+            name = getattr(self, "_desired_chats", {}).get(key, key)
+            self._remove_listen(name, key=key)
         try:
             self.wx.listen.clear()
         except Exception:
             logger.warning("清空 wxauto 监听状态失败", exc_info=True)
         self.listen_chats.clear()
         self._chatwnd_cache.clear()
+        getattr(self, "_title_check_at", {}).clear()
+        getattr(self, "_message_failures", {}).clear()
 
     def _cleanup_wechat(self):
         if getattr(self, "wx", None):
@@ -619,14 +723,20 @@ class WeChatListener:
             desired = list(getattr(self, "_desired_chats", {}).values())
             if not desired:
                 desired = [item["name"] for item in self.target_specs]
-            self._cleanup_wechat()
             self.wx = self._wechat_class()
             self.listen_chats.clear()
             self._chatwnd_cache.clear()
-            self._failed_chats.clear()
+            self._title_check_at = {}
+            self._message_failures = {}
+            self._last_health_check = None
+            self._message_poll_cursor = 0
             self._desired_chats = {normalize_chat_name(name): name for name in desired}
-            for name in desired:
-                self._add_listen_chat(name)
+            retry_at = time.monotonic()
+            self._failed_chats = {
+                normalize_chat_name(name): ChatRecoveryState(
+                    name=name, next_retry=retry_at, reason="微信主窗口重连后等待重建")
+                for name in desired
+            }
             # A missing/deleted chat is handled by its own retry state and must not
             # keep the main-window reconnect loop tearing down healthy listeners.
             return True

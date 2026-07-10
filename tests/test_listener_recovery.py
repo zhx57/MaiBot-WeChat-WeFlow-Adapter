@@ -1,10 +1,17 @@
 import queue
+import sys
 import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from wx_Listener import ChatRecoveryState, UICommand, WeChatListener
+from wx_Listener import (
+    ChatRecoveryState,
+    UICommand,
+    UICommandQueue,
+    UICommandTimeout,
+    WeChatListener,
+)
 
 
 class _WaitingCommands:
@@ -31,8 +38,14 @@ class ListenerRecoveryTest(unittest.TestCase):
         listener._desired_chats = {}
         listener._chatwnd_cache = {}
         listener._failed_chats = {}
+        listener._last_health_check = None
+        listener._title_check_at = {}
+        listener._message_poll_cursor = 0
+        listener._message_failures = {}
         listener._command_active = False
         listener._command_started = None
+        listener._recovery_active = False
+        listener._recovery_started = None
         listener._check_listener_health = Mock()
         listener._check_new_messages = Mock()
         listener._retry_failed_chats = Mock()
@@ -77,6 +90,47 @@ class ListenerRecoveryTest(unittest.TestCase):
         self.assertFalse(listener._command_active)
         self.assertIsNone(listener._command_started)
 
+    def test_command_drain_executes_only_one_item_per_tick(self):
+        listener = self.make_listener()
+        first = UICommand(action="send", args=("one", "text", "1"), timeout=15)
+        second = UICommand(action="send", args=("two", "text", "2"), timeout=15)
+        commands = Mock()
+        commands.get_nowait.side_effect = [first, second]
+        listener.commands = commands
+        listener._send = Mock(return_value=True)
+
+        listener._drain_commands(limit=20)
+
+        self.assertTrue(first.future.result())
+        self.assertFalse(second.future.done())
+        commands.get_nowait.assert_called_once_with()
+        commands.task_done.assert_called_once_with()
+
+    def test_started_command_timeout_is_bounded_and_not_retry_safe(self):
+        commands = UICommandQueue()
+        commands._queue.put = Mock(
+            side_effect=lambda command, timeout: command.begin())
+
+        with self.assertRaises(UICommandTimeout) as raised:
+            commands.submit("send", "target", "text", "hello", timeout=0.01)
+
+        self.assertFalse(raised.exception.retry_safe)
+        self.assertIsNotNone(raised.exception.command_future)
+
+    def test_completed_command_timeout_is_not_misclassified_as_wait_timeout(self):
+        commands = UICommandQueue()
+
+        def complete_with_timeout(command, timeout):
+            command.begin()
+            command.future.set_exception(TimeoutError("send operation timed out"))
+
+        commands._queue.put = Mock(side_effect=complete_with_timeout)
+
+        with self.assertRaisesRegex(TimeoutError, "send operation timed out") as raised:
+            commands.submit("send", "target", "text", "hello", timeout=0.01)
+
+        self.assertNotIsInstance(raised.exception, UICommandTimeout)
+
     def make_lifecycle_listener(self):
         listener = WeChatListener.__new__(WeChatListener)
         listener._owner_thread = threading.get_ident()
@@ -87,6 +141,10 @@ class ListenerRecoveryTest(unittest.TestCase):
         listener._desired_chats = {"Bad": "Bad", "Good": "Good"}
         listener._failed_chats = {}
         listener._chatwnd_cache = {}
+        listener._last_health_check = None
+        listener._title_check_at = {}
+        listener._message_poll_cursor = 0
+        listener._message_failures = {}
         return listener
 
     @patch("wx_Listener.time.monotonic", return_value=100)
@@ -105,6 +163,7 @@ class ListenerRecoveryTest(unittest.TestCase):
         listener._check_listener_health()
 
         self.assertNotIn("Bad", listener.wx.listen)
+        bad.Close.assert_not_called()
         self.assertIs(listener.wx.listen["Good"], good)
         self.assertIs(listener._chatwnd_cache["Good"], good)
         self.assertEqual(listener._failed_chats["Bad"].next_retry, 100)
@@ -114,6 +173,84 @@ class ListenerRecoveryTest(unittest.TestCase):
         self.assertIs(listener._chatwnd_cache["Bad"], rebuilt)
         self.assertEqual(listener.listen_chats["Good"], "Good")
         self.assertNotIn("Bad", listener._failed_chats)
+
+    @patch("wx_Listener.time.monotonic", side_effect=[100, 102])
+    def test_listener_health_is_throttled_for_five_seconds(self, _monotonic):
+        listener = self.make_lifecycle_listener()
+        chat = SimpleNamespace()
+        listener.listen_chats = {"Good": "Good"}
+        listener._desired_chats = {"Good": "Good"}
+        listener.wx = SimpleNamespace(listen={"Good": chat})
+        listener._chatwnd_is_alive = Mock(return_value=True)
+        listener._refresh_chat_title = Mock()
+
+        listener._check_listener_health()
+        listener._check_listener_health()
+
+        listener._chatwnd_is_alive.assert_called_once_with(chat)
+        listener._refresh_chat_title.assert_called_once_with("Good", chat)
+
+    @patch("wx_Listener.time.monotonic", return_value=100)
+    def test_retry_failed_chats_rebuilds_only_one_per_tick(self, _monotonic):
+        listener = self.make_lifecycle_listener()
+        listener._failed_chats = {
+            "One": ChatRecoveryState("One", next_retry=0, disabled=True),
+            "Two": ChatRecoveryState("Two", next_retry=0),
+        }
+        listener._add_listen_chat = Mock(return_value=True)
+
+        listener._retry_failed_chats()
+
+        listener._add_listen_chat.assert_called_once_with("One", max_retries=1)
+        self.assertFalse(listener._failed_chats["One"].disabled)
+        self.assertFalse(listener._recovery_active)
+        self.assertIsNone(listener._recovery_started)
+
+    @patch("wx_Listener.time.monotonic", return_value=100)
+    def test_mark_failed_discards_state_without_closing_window(self, _monotonic):
+        listener = self.make_lifecycle_listener()
+        chat = SimpleNamespace(Close=Mock())
+        listener.listen_chats = {"Bad": "Bad"}
+        listener._desired_chats = {"Bad": "Bad"}
+        listener.wx = SimpleNamespace(listen={"Bad": chat})
+
+        listener._mark_chat_failed("Bad", "invalid")
+
+        chat.Close.assert_not_called()
+        self.assertNotIn("Bad", listener.wx.listen)
+        self.assertNotIn("Bad", listener.listen_chats)
+        self.assertIn("Bad", listener._failed_chats)
+
+    @patch("wx_Listener.time.monotonic", return_value=100)
+    def test_title_refresh_ignores_dynamic_unread_suffix(self, _monotonic):
+        listener = self.make_lifecycle_listener()
+        chat = SimpleNamespace(
+            HWND=123, uia_name="Good", who="Good", Rebind=Mock())
+        listener.listen_chats = {"Good": "Good"}
+        listener._desired_chats = {"Good": "Good"}
+        listener.wx = SimpleNamespace(listen={"Good": chat})
+        win32gui = SimpleNamespace(GetWindowText=Mock(return_value="Good (3)"))
+
+        with patch.dict(sys.modules, {"win32gui": win32gui}):
+            listener._refresh_chat_title("Good", chat)
+
+        chat.Rebind.assert_not_called()
+        self.assertIs(listener.wx.listen["Good"], chat)
+
+    @patch("wx_Listener.time.monotonic", side_effect=[100, 110])
+    def test_title_refresh_is_throttled_for_thirty_seconds(self, _monotonic):
+        listener = self.make_lifecycle_listener()
+        chat = SimpleNamespace(HWND=123, uia_name="Good", who="Good", Rebind=Mock())
+        listener.listen_chats = {"Good": "Good"}
+        listener._desired_chats = {"Good": "Good"}
+        listener.wx = SimpleNamespace(listen={"Good": chat})
+        win32gui = SimpleNamespace(GetWindowText=Mock(return_value="Good"))
+
+        with patch.dict(sys.modules, {"win32gui": win32gui}):
+            listener._refresh_chat_title("Good", chat)
+            listener._refresh_chat_title("Good", chat)
+
+        win32gui.GetWindowText.assert_called_once_with(123)
 
     def test_message_error_marks_only_the_failed_chat(self):
         listener = self.make_lifecycle_listener()
@@ -131,6 +268,26 @@ class ListenerRecoveryTest(unittest.TestCase):
         listener._mark_chat_failed.assert_called_once()
         listener._process_message.assert_called_once_with("Good", message)
 
+    def test_three_message_poll_failures_rebuild_only_selected_chat(self):
+        listener = self.make_lifecycle_listener()
+        chat = SimpleNamespace(who="Good")
+        listener.chat_types = {"Good": "group"}
+        listener.listen_chats = {"Good": "Good"}
+        listener._desired_chats = {"Good": "Good"}
+        listener.wx = SimpleNamespace(
+            listen={"Good": chat},
+            listen_errors={},
+            GetListenMessage=Mock(side_effect=RuntimeError("stalled")),
+        )
+
+        listener._check_new_messages()
+        listener._check_new_messages()
+        listener._check_new_messages()
+
+        self.assertNotIn("Good", listener.listen_chats)
+        self.assertNotIn("Good", listener.wx.listen)
+        self.assertIn("Good", listener._failed_chats)
+
     @patch("wx_Listener.time.monotonic", return_value=100)
     def test_chat_recovery_uses_exponential_backoff(self, _monotonic):
         listener = self.make_lifecycle_listener()
@@ -140,7 +297,8 @@ class ListenerRecoveryTest(unittest.TestCase):
             listener._schedule_chat_retry("Bad", "Bad", RuntimeError("missing"))
             self.assertEqual(listener._failed_chats["Bad"].next_retry, deadline)
         listener._schedule_chat_retry("Bad", "Bad", RuntimeError("missing"))
-        self.assertTrue(listener._failed_chats["Bad"].disabled)
+        self.assertFalse(listener._failed_chats["Bad"].disabled)
+        self.assertEqual(listener._failed_chats["Bad"].next_retry, 130)
 
     def test_main_window_reconnect_resets_all_runtime_chat_state(self):
         listener = self.make_lifecycle_listener()
@@ -151,7 +309,6 @@ class ListenerRecoveryTest(unittest.TestCase):
         new_wx = SimpleNamespace(listen={})
         listener.wx = old_wx
         listener._wechat_class = Mock(return_value=new_wx)
-        listener._cleanup_wechat = Mock()
         listener._add_listen_chat = Mock(return_value=True)
 
         self.assertTrue(listener._reconnect_wechat())
@@ -159,10 +316,10 @@ class ListenerRecoveryTest(unittest.TestCase):
         self.assertIs(listener.wx, new_wx)
         self.assertEqual(listener.listen_chats, {})
         self.assertEqual(listener._chatwnd_cache, {})
-        self.assertEqual(listener._failed_chats, {})
+        self.assertEqual(set(listener._failed_chats), {"Bad", "Good"})
         self.assertEqual(
             [call.args[0] for call in listener._add_listen_chat.call_args_list],
-            ["Bad", "Good"],
+            [],
         )
 
 
