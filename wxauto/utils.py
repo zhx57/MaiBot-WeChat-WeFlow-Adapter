@@ -203,6 +203,19 @@ def FindWindow(classname=None, name=None) -> int:
     return win32gui.FindWindow(classname, name)
 
 
+def EnsureWindowVisibleNoActivate(hwnd) -> bool:
+    """Make a hidden/minimized window renderable without taking user focus."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+
+    if win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
+        # SW_SHOWNOACTIVATE restores the last size/position without activating the
+        # window.  Do not BringWindowToTop/SetWindowPos here: a listener must not
+        # disturb either keyboard focus or the user's window stacking order.
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+    return not win32gui.IsIconic(hwnd) and win32gui.IsWindowVisible(hwnd)
+
+
 def ActivateWindow(hwnd) -> bool:
     """Show and foreground a window, doing no work when it is already active."""
     if not hwnd or not win32gui.IsWindow(hwnd):

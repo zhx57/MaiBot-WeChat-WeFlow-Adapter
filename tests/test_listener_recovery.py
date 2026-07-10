@@ -252,7 +252,7 @@ class ListenerRecoveryTest(unittest.TestCase):
 
         win32gui.GetWindowText.assert_called_once_with(123)
 
-    def test_message_error_marks_only_the_failed_chat(self):
+    def test_single_message_error_does_not_rebuild_chat(self):
         listener = self.make_lifecycle_listener()
         good_chat = Mock(who="Good")
         message = SimpleNamespace(type="friend", sender="Alice", content="hello")
@@ -265,8 +265,27 @@ class ListenerRecoveryTest(unittest.TestCase):
 
         listener._check_new_messages()
 
-        listener._mark_chat_failed.assert_called_once()
+        listener._mark_chat_failed.assert_not_called()
+        self.assertEqual(listener._message_failures["Bad"], 1)
         listener._process_message.assert_called_once_with("Good", message)
+
+    def test_three_isolated_message_errors_rebuild_only_failed_chat(self):
+        listener = self.make_lifecycle_listener()
+        chat = SimpleNamespace(who="Bad")
+        listener.listen_chats = {"Bad": "Bad"}
+        listener._desired_chats = {"Bad": "Bad"}
+        listener.wx = SimpleNamespace(listen={"Bad": chat})
+
+        def fail(_key):
+            listener.wx.listen_errors = {"Bad": RuntimeError("UIA timeout")}
+            return []
+
+        listener.wx.GetListenMessage = Mock(side_effect=fail)
+        for _ in range(3):
+            listener._check_new_messages()
+
+        self.assertNotIn("Bad", listener.listen_chats)
+        self.assertIn("Bad", listener._failed_chats)
 
     def test_three_message_poll_failures_rebuild_only_selected_chat(self):
         listener = self.make_lifecycle_listener()

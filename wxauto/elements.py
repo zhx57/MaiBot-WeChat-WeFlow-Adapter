@@ -188,6 +188,9 @@ class WeChatBase:
 
 
 class ChatWnd(WeChatBase):
+    _MESSAGE_SNAPSHOT_ATTEMPTS = 3
+    _MESSAGE_SNAPSHOT_RETRY_DELAY = 0.05
+
     def __init__(self, who, language='cn', uia_name=None, hwnd=None):
         self.who = who
         self.uia_name = uia_name or who
@@ -355,9 +358,26 @@ class ChatWnd(WeChatBase):
             list: 聊天记录信息
         '''
         wxlog.debug(f"获取所有聊天记录：{self.who}")
-        MsgItems = self.C_MsgList.GetChildren()
+        MsgItems = self._get_message_snapshot()
         msgs = self._getmsgs(MsgItems, savepic, savefile, savevoice)
         return msgs
+
+    def _get_message_snapshot(self):
+        """Read the UIA tree without foregrounding the independent chat window."""
+        EnsureWindowVisibleNoActivate(self.HWND)
+        last_error = None
+        for attempt in range(self._MESSAGE_SNAPSHOT_ATTEMPTS):
+            try:
+                items = self.C_MsgList.GetChildren()
+                if items:
+                    return items
+            except Exception as exc:
+                last_error = exc
+            if attempt + 1 < self._MESSAGE_SNAPSHOT_ATTEMPTS:
+                time.sleep(self._MESSAGE_SNAPSHOT_RETRY_DELAY)
+        if last_error is not None:
+            raise last_error
+        return []
     
     def GetNewMessage(self, savepic=False, savefile=False, savevoice=False):
         '''获取当前窗口中加载的新聊天记录
@@ -371,13 +391,19 @@ class ChatWnd(WeChatBase):
             list: 新聊天记录信息
         '''
         wxlog.debug(f"获取新聊天记录：{self.who}")
-        MsgItems = self.C_MsgList.GetChildren()
+        MsgItems = self._get_message_snapshot()
         msgids = [
             ''.join([str(part) for part in item.GetRuntimeId()])
             for item in MsgItems
             if item.ControlTypeName == 'ListItemControl'
         ]
         if getattr(self, '_baseline_pending', not bool(self.usedmsgid)):
+            # Chromium can temporarily expose an empty accessibility tree while
+            # a background/minimized window is resuming.  It is not a baseline.
+            if not msgids:
+                self._baseline_candidate = None
+                self._baseline_stable_polls = 0
+                return []
             if msgids == getattr(self, '_baseline_candidate', None):
                 self._baseline_stable_polls += 1
             else:
@@ -387,6 +413,10 @@ class ChatWnd(WeChatBase):
                 self.usedmsgid = msgids
                 self._baseline_pending = False
                 self._baseline_candidate = None
+            return []
+        if not msgids:
+            # Preserve the last known IDs.  Treating a transient empty UIA tree
+            # as the new state would replay the whole visible history later.
             return []
         NewMsgItems = [
             item for item in MsgItems

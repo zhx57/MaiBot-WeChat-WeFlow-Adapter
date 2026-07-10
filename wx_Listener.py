@@ -493,8 +493,16 @@ class WeChatListener:
         try:
             polled = self.wx.GetListenMessage(selected_key) or []
             for key, exc in getattr(self.wx, "listen_errors", {}).items():
-                self._mark_chat_failed(key, f"读取消息失败: {exc}")
-                getattr(self, "_message_failures", {}).pop(key, None)
+                failures = getattr(self, "_message_failures", None)
+                if failures is None:
+                    failures = self._message_failures = {}
+                failures[key] = failures.get(key, 0) + 1
+                count = failures[key]
+                logger.warning("读取消息暂时失败 chat=%s count=%d/%d: %s",
+                               key, count, MESSAGE_FAILURE_REBUILD_AFTER, exc)
+                if count >= MESSAGE_FAILURE_REBUILD_AFTER:
+                    failures.pop(key, None)
+                    self._mark_chat_failed(key, f"连续读取消息失败: {exc}")
             if isinstance(polled, dict):
                 message_batches = polled.items()
             else:
@@ -512,7 +520,8 @@ class WeChatListener:
                     except Exception:
                         logger.exception("处理微信消息失败，已隔离 chat=%s", configured_name)
             self._msg_fail_count = 0
-            getattr(self, "_message_failures", {}).pop(selected_key, None)
+            if selected_key not in getattr(self.wx, "listen_errors", {}):
+                getattr(self, "_message_failures", {}).pop(selected_key, None)
         except Exception as exc:
             self._msg_fail_count = getattr(self, "_msg_fail_count", 0) + 1
             failures = getattr(self, "_message_failures", None)

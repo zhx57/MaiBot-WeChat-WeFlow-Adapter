@@ -52,6 +52,8 @@ def _load_elements_module():
         sys.modules[module.__name__] = module
     sys.modules[f"{package_name}.utils"].wxlog = logging.getLogger(
         "elements-isolation-test")
+    sys.modules[f"{package_name}.utils"].EnsureWindowVisibleNoActivate = Mock(
+        return_value=True)
 
     path = Path(__file__).parents[1] / "wxauto" / "elements.py"
     spec = importlib.util.spec_from_file_location(f"{package_name}.elements", path)
@@ -89,12 +91,13 @@ class GetListenMessageIsolationTest(unittest.TestCase):
         new_message = item(2)
         chat = module.ChatWnd.__new__(module.ChatWnd)
         chat.who = "Target"
+        chat.HWND = 123
         chat.usedmsgid = []
         chat._baseline_pending = True
         chat._baseline_candidate = None
         chat._baseline_stable_polls = 0
         chat.C_MsgList = SimpleNamespace(GetChildren=Mock(side_effect=[
-            [], [history], [history], [history, new_message],
+            [], [], [], [history], [history], [history, new_message],
         ]))
         chat._getmsgs = Mock(return_value=["new"])
 
@@ -103,6 +106,24 @@ class GetListenMessageIsolationTest(unittest.TestCase):
         self.assertEqual(chat.GetNewMessage(), [])
         self.assertEqual(chat.GetNewMessage(), ["new"])
         chat._getmsgs.assert_called_once_with([new_message], False, False, False)
+
+    def test_background_read_uses_no_activate_visibility_and_retries_empty_tree(self):
+        module = _load_elements_module()
+        visible = sys.modules[module.__package__ + ".utils"].EnsureWindowVisibleNoActivate
+        message = SimpleNamespace(
+            ControlTypeName="ListItemControl", GetRuntimeId=lambda: [7])
+        chat = module.ChatWnd.__new__(module.ChatWnd)
+        chat.who = "Target"
+        chat.HWND = 456
+        chat.usedmsgid = ["1"]
+        chat._baseline_pending = False
+        chat.C_MsgList = SimpleNamespace(
+            GetChildren=Mock(side_effect=[[], [message]]))
+        chat._getmsgs = Mock(return_value=["new"])
+
+        self.assertEqual(chat.GetNewMessage(), ["new"])
+        visible.assert_called_once_with(456)
+        self.assertEqual(chat.C_MsgList.GetChildren.call_count, 2)
 
 
 if __name__ == "__main__":
