@@ -130,7 +130,8 @@ class WeChatBase:
             if accept_button.Exists(2):
                 accept_button.Click(simulateMove=False)
             
-            while True:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
                 try:
                     filecontrol = msgitem.ButtonControl(Name='')
                     filecontrol.RightClick(simulateMove=False)
@@ -142,8 +143,10 @@ class WeChatBase:
                         break
                     else:
                         filecontrol.RightClick(simulateMove=False)
-                except:
-                    pass
+                except Exception:
+                    time.sleep(0.2)
+            else:
+                raise TimeoutError('等待微信文件接收完成超时')
         filepath = ReadClipboardData().get('15')[0]
         savepath = os.path.join(WxParam.DEFALUT_SAVEPATH, os.path.split(filepath)[1])
         if not os.path.exists(WxParam.DEFALUT_SAVEPATH):
@@ -169,12 +172,14 @@ class WeChatBase:
             option.Click(simulateMove=False)
 
         text = ''
-        while True:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             if msgitem.GetProgenyControl(8, 4):
                 if msgitem.GetProgenyControl(8, 4).Name == text:
                     return text
                 text = msgitem.GetProgenyControl(8, 4).Name
             time.sleep(0.1)
+        raise TimeoutError('等待语音转文字超时')
 
 
 class ChatWnd(WeChatBase):
@@ -521,7 +526,7 @@ class TextElement:
             self.sender_remark = _[0].TextControl().Name
             self.content = _[1].TextControl().Name
             self.chattype = 'group'
-            numtext = re.findall(' \(\d+\)', chatname)[-1]
+            numtext = re.findall(r' \(\d+\)', chatname)[-1]
             self.chatname = chatname[:-len(numtext)]
             
         self.info = {
@@ -597,7 +602,7 @@ class ContactWnd:
         """获取好友人数"""
         wxlog.debug('获取好友人数')
         numText = self.Sidebar.PaneControl(Name='全部').TextControl(foundIndex=2).Name
-        return int(re.findall('\d+', numText)[0])
+        return int(re.findall(r'\d+', numText)[0])
     
     def Search(self, keyword):
         """搜索好友

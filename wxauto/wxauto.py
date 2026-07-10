@@ -21,8 +21,6 @@ except:
 class WeChat(WeChatBase):
     VERSION: str = '3.9.11.17'
     lastmsgid: str = None
-    listen: dict = dict()
-    SessionItemList: list = []
 
     def __init__(
             self, 
@@ -35,9 +33,11 @@ class WeChat(WeChatBase):
             language (str, optional): 微信客户端语言版本, 可选: cn简体中文  cn_t繁体中文  en英文, 默认cn, 即简体中文
         """
         self.UiaAPI: uia.WindowControl = uia.WindowControl(ClassName='WeChatMainWndForPC', searchDepth=1)
+        self.listen = {}
+        self.SessionItemList = []
         set_debug(debug)
         self.language = language
-        # self._checkversion()
+        self._checkversion()
         self._show()
         MainControl1 = [i for i in self.UiaAPI.GetChildren() if not i.ClassName][0]
         MainControl2 = MainControl1.GetFirstChildControl()
@@ -78,8 +78,10 @@ class WeChat(WeChatBase):
         wxpath = GetPathByHwnd(self.HWND)
         wxversion = GetVersionByPath(wxpath)
         if wxversion != self.VERSION:
-            Warnings.lightred(self._lang('版本不一致', 'WARNING').format(wxversion, self.VERSION), stacklevel=2)
-            return False
+            raise RuntimeError(
+                f'不支持的微信版本 {wxversion!r}，当前 wxauto 仅支持 {self.VERSION}'
+            )
+        return True
     
     
     def _show(self):
@@ -166,7 +168,7 @@ class WeChat(WeChatBase):
             sessionname (str): 聊天对象名
             amount (int): 新消息条数
         """
-        matchobj = re.search('\d+条新消息', SessionItem.Name)
+        matchobj = re.search(r'\d+条新消息', SessionItem.Name)
         amount = 0
         if matchobj:
             try:
@@ -313,7 +315,7 @@ class WeChat(WeChatBase):
         self._show()
         sessiondict = self.GetSessionList(True)
         if who in list(sessiondict.keys())[:-1]:
-            self.SessionBox.ListItemControl(RegexName=who).Click(simulateMove=False)
+            self.SessionBox.ListItemControl(RegexName=f'^{re.escape(who)}$').Click(simulateMove=False)
             return who
         else:
             self.UiaAPI.SendKeys('{Ctrl}f', waitTime=1)
@@ -530,9 +532,24 @@ class WeChat(WeChatBase):
         """
         exists = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who).Exists(maxSearchSeconds=0.1)
         if not exists:
-            self.ChatWith(who)
-            self.SessionBox.ListItemControl(RegexName=who).DoubleClick(simulateMove=False)
-        self.listen[who] = ChatWnd(who, self.language)
+            selected = self.ChatWith(who)
+            if selected is False or selected != who:
+                raise TargetNotFoundError(f'未精确打开监听目标：{who}')
+            matches = [item for item in self.SessionBox.ListControl().GetChildren()
+                       if getattr(item, 'Name', None) == who]
+            if len(matches) > 1:
+                raise TargetNotFoundError(f'存在多个同名会话，拒绝自动选择：{who}')
+            item = self.SessionBox.ListItemControl(RegexName=f'^{re.escape(who)}$')
+            if not item.Exists(maxSearchSeconds=2):
+                raise TargetNotFoundError(f'会话列表中不存在监听目标：{who}')
+            item.DoubleClick(simulateMove=False)
+            window = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who)
+            if not window.Exists(maxSearchSeconds=5):
+                raise TargetNotFoundError(f'独立聊天窗口未出现：{who}')
+        chat = ChatWnd(who, self.language)
+        if not chat.UiaAPI.Exists(maxSearchSeconds=2) or chat.who != who:
+            raise TargetNotFoundError(f'监听窗口校验失败：{who}')
+        self.listen[who] = chat
         self.listen[who].savepic = savepic
         self.listen[who].savefile = savefile
         self.listen[who].savevoice = savevoice

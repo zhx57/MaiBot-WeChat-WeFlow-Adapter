@@ -1,866 +1,448 @@
+"""MaiBot message conversion and Router lifecycle.
+
+This module deliberately has no wxauto imports.  UI work is submitted to the
+single UI thread owned by :mod:`wx_Listener`.
+"""
+
+import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import logging
-import time
-import hashlib
-import asyncio
-from datetime import datetime
-from config import MAIBOT_API_URL, PLATFORM_ID
-from maim_message import Router, RouteConfig, TargetConfig, MessageBase, BaseMessageInfo, UserInfo, GroupInfo, Seg
 import os
+import tempfile
+import threading
+import time
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from pathlib import Path
 
+from maim_message import (
+    BaseMessageInfo,
+    FormatInfo,
+    GroupInfo,
+    MessageBase,
+    ReceiverInfo,
+    RouteConfig,
+    Router,
+    Seg,
+    SenderInfo,
+    TargetConfig,
+    UserInfo,
+)
 
-class _SendOnlyChatWnd:
-    """轻量版 ChatWnd，仅供发送消息，跳过 GetAllMessage()。
-
-    原版 wxauto.elements.ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录，
-    UIA 遍历极慢(10s+)。发送消息只用 editbox，根本不需要消息历史。
-    这里只初始化发送所需的最小属性集，把首次发送从 ~10s 压到 ~1s。
-    复用 wxauto.elements.ChatWnd 的 _show / SendMsg 实现（动态绑定）。
-    """
-
-    def __init__(self, who, language='cn'):
-        from wxauto import uiautomation as uia
-        from wxauto.elements import ChatWnd
-        self.who = who
-        self.language = language
-        self.usedmsgid = []  # GetNewMessage 用，发送不需要，留空避免属性错误
-        self.savepic = False
-        self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who)
-        self.editbox = self.UiaAPI.EditControl()
-        # 复用 ChatWnd 的 _show / SendMsg / SendFiles 方法实现
-        # SendFiles 也只用 editbox（Ctrl+a/Ctrl+v/Enter），不需要 C_MsgList，
-        # 绑定后图片/文件发送也能复用缓存实例，避免每次新建 ChatWnd 调 GetAllMessage
-        self._show = ChatWnd._show.__get__(self, ChatWnd)
-        self.SendMsg = ChatWnd.SendMsg.__get__(self, ChatWnd)
-        self.SendFiles = ChatWnd.SendFiles.__get__(self, ChatWnd)
-
-
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+from config import (
+    ID_MAP_FILE,
+    IMAGE_RECOGNITION_ENABLED,
+    MAIBOT_API_URL,
+    MAX_MEDIA_BYTES,
+    PLATFORM_ID,
+    SEND_QUEUE_SIZE,
+    WX_BOT_NICKNAME,
 )
 
 logger = logging.getLogger(__name__)
 
-# MaiBot API 配置已移动到config.py
+_IMAGE_MAGIC = {
+    b"\x89PNG\r\n\x1a\n": ".png",
+    b"\xff\xd8\xff": ".jpg",
+    b"GIF87a": ".gif",
+    b"GIF89a": ".gif",
+    b"RIFF": ".webp",
+}
+
 
 class MessageProcessor:
-    def __init__(self, platform=PLATFORM_ID):
-        """
-        初始化消息处理器
-
-        Args:
-            platform (str): 消息平台标识，默认使用配置文件中的PLATFORM_ID
-        """
+    def __init__(self, platform=PLATFORM_ID, ui_submit=None, inbound_enabled=True,
+                 outbound_enabled=True):
         self.platform = platform
-        self.router = None
-        self.router_task = None
-        # 消息发送队列，确保按顺序发送
-        self.send_queue = None  # 将在start_router中初始化
-        self.send_task = None
-        # md5哈希 → 可读名称 的映射表
-        # 入站时把 md5(sender)/md5(group_name) → 原始名称 记下来，
-        # 出站时麦麦回复的 receiver_info 里只有 md5 哈希没有可读昵称，
-        # 用这个表反查出 wxauto 需要的群名/昵称。
+        self.ui_submit = ui_submit
+        self.inbound_enabled = inbound_enabled
+        self.outbound_enabled = outbound_enabled
+        self.ready_event = threading.Event()
+        self.startup_error = None
+        self._thread = None
+        self._loop = None
+        self._router_task = None
+        self._send_task = None
+        self._stopping = threading.Event()
+        self._id_lock = threading.RLock()
         self._id_to_name = {}
-        # ChatWnd 实例缓存：wxauto 的 WeChat.SendMsg 每次都新建 ChatWnd，
-        # 而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
-        # 缓存后只有第一次发送需要读全部记录，后续发送直接复用，大幅降低延迟。
-        self._chatwnd_cache = {}
-        logger.info(f"消息处理器初始化成功，平台：{platform}")
+        self._dead_letters = []
+        self._load_id_map()
 
-        # 初始化Router
-        self._init_router()
-    
-    def _init_router(self):
-        """初始化Router用于与MaiBot通信"""
+        route = RouteConfig(route_config={
+            platform: TargetConfig(url=MAIBOT_API_URL, token=None, ssl_verify=None)
+        })
+        self.router = Router(route, custom_logger=logger)
+        self.router.register_class_handler(self._handle_maibot_response)
+
+    def set_ui_submit(self, submit):
+        self.ui_submit = submit
+
+    def register_target(self, name, chat_type):
+        """Preload routable configured targets for replies arriving after restart."""
+        if chat_type == "group":
+            self._remember(self._stable_id("group", name), name, chat_type)
+        elif chat_type == "private":
+            self._remember(self._stable_id("private", name), name, chat_type)
+
+    def start(self, timeout=20):
+        """Start Router and wait until its websocket connection is usable."""
+        if self._thread and self._thread.is_alive():
+            return
+        self.ready_event.clear()
+        self.startup_error = None
+        self._stopping.clear()
+        self._thread = threading.Thread(target=self._router_thread, name="maibot-router", daemon=True)
+        self._thread.start()
+        if not self.ready_event.wait(timeout):
+            self.stop()
+            raise TimeoutError(f"Router 启动超过 {timeout} 秒")
+        if self.startup_error:
+            error = self.startup_error
+            self.stop()
+            raise RuntimeError("Router 启动失败") from error
+
+    def _router_thread(self):
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
         try:
-            # 配置路由
-            route_config = RouteConfig(
-                route_config={
-                    self.platform: TargetConfig(
-                        url=MAIBOT_API_URL,
-                        token=None  # 如果需要认证，在这里设置token
-                    )
-                }
-            )
-            
-            # 创建Router实例
-            self.router = Router(route_config)
-            
-            # 注册消息处理器
-            self.router.register_class_handler(self._handle_maibot_response)
-            
-            logger.info(f"Router初始化成功，平台：{self.platform}")
-        except Exception as e:
-            logger.error(f"Router初始化失败: {str(e)}")
-    
-    async def _process_send_queue(self):
-        """处理消息发送队列，确保按顺序发送"""
-        while True:
+            self._send_queue = asyncio.Queue(maxsize=SEND_QUEUE_SIZE)
+            self._send_task = loop.create_task(self._process_send_queue())
+            self._router_task = loop.create_task(self.router.run())
+            loop.run_until_complete(self._wait_router_ready())
+            self.ready_event.set()
+            loop.run_until_complete(self._router_task)
+        except BaseException as exc:
+            if not self._stopping.is_set():
+                self.startup_error = exc
+                logger.exception("Router 线程异常")
+            self.ready_event.set()
+        finally:
+            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+            self._loop = None
+
+    async def _wait_router_ready(self):
+        while not self._router_task.done():
+            if self.router.check_connection(self.platform):
+                return
+            await asyncio.sleep(0.05)
+        await self._router_task
+        raise RuntimeError("Router 在连接就绪前退出")
+
+    def stop(self, timeout=15):
+        """Stop websocket, cancel workers, close loop, and join its thread."""
+        self._stopping.set()
+        loop = self._loop
+        if loop and loop.is_running():
+            async def shutdown():
+                self.router._running = False
+                await self.router.stop()
+
+            future = asyncio.run_coroutine_threadsafe(shutdown(), loop)
             try:
-                # 从队列获取消息，等待最多5秒
-                receiver, content = await asyncio.wait_for(self.send_queue.get(), timeout=5.0)
-                
-                # 执行实际的发送操作
-                await self._send_to_wechat_sync(receiver, content)
-                
-                # 标记任务完成
-                self.send_queue.task_done()
-            except asyncio.TimeoutError:
-                # 超时继续循环
-                continue
-            except Exception as e:
-                logger.error(f"处理发送队列时发生错误: {str(e)}")
-                import traceback
-                logger.error(f"错误详情: {traceback.format_exc()}")
-    
-    def start_router(self):
-        """启动Router"""
-        try:
-            if self.router:
-                # 创建新的事件循环
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # 保存事件循环引用，供 _send_to_maibot 跨线程提交协程用
-                # （router.send_message 复用 Router 的 WebSocket 连接，必须在
-                # 同一事件循环上执行，跨循环用 asyncio.run 会抛
-                # "Future attached to a different loop"）
-                self._router_loop = loop
-                
-                # 初始化消息发送队列
-                self.send_queue = asyncio.Queue()
-                
-                # 启动消息发送队列处理任务
-                self.send_task = loop.create_task(self._process_send_queue())
-                logger.info("消息发送队列已启动")
-                
-                # 启动Router（run_until_complete 会阻塞直到 Router 停止）
-                logger.info("Router 正在启动...")
-                self.router_task = loop.run_until_complete(self.router.run())
-        except Exception as e:
-            logger.error(f"Router启动失败: {str(e)}")
-    
+                future.result(timeout=timeout)
+            except FutureCancelledError:
+                logger.warning("Router stop future 被底层取消，继续等待线程清理")
+            except (FutureTimeoutError, RuntimeError):
+                logger.error("Router 停止超时")
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                logger.error("Router 线程未在时限内退出")
+
+    async def _process_send_queue(self):
+        while True:
+            item = await self._send_queue.get()
+            try:
+                receiver, kind, data, completion = item
+                try:
+                    await self._deliver_with_retry(receiver, kind, data)
+                    if not completion.done():
+                        completion.set_result(True)
+                except BaseException as exc:
+                    if not completion.done():
+                        completion.set_exception(exc)
+                    logger.error("发送队列项目最终失败: %s", exc)
+            finally:
+                self._send_queue.task_done()
+
+    async def _deliver_with_retry(self, receiver, kind, data):
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                if not self.ui_submit:
+                    raise RuntimeError("UI 命令执行器尚未绑定")
+                ok = await asyncio.to_thread(self.ui_submit, "send", receiver, kind, data, 15)
+                if ok is not True:
+                    raise RuntimeError("wxauto 返回发送失败")
+                logger.info("消息已发送 target=%s type=%s", receiver, kind)
+                return
+            except Exception as exc:
+                last_error = exc
+                logger.warning("发送失败 target=%s type=%s attempt=%d/3: %s",
+                               receiver, kind, attempt, exc)
+                if attempt < 3:
+                    await asyncio.sleep(attempt)
+        dead = {"receiver": receiver, "type": kind, "error": str(last_error), "time": time.time()}
+        self._dead_letters.append(dead)
+        logger.error("消息进入死信 target=%s type=%s error=%s", receiver, kind, last_error)
+        raise RuntimeError("微信消息发送重试耗尽") from last_error
+
     async def _handle_maibot_response(self, message):
-        """处理来自MaiBot的回复消息"""
+        if not self.outbound_enabled:
+            return
         try:
-            logger.info(f"收到原始消息: {type(message)} - {message}")
-            
-            # 如果message是字典，转换为MessageBase对象
             if isinstance(message, dict):
                 message = MessageBase.from_dict(message)
-                logger.info("消息已转换为MessageBase对象")
-            
-            # 提取消息ID和内容用于日志
-            message_info = message.message_info
-            message_segment = message.message_segment
-            message_id = getattr(message_info, 'message_id', None) if message_info else None
-            
-            # 提取消息内容预览
-            if hasattr(message_segment, 'type') and message_segment.type == 'text':
-                content_preview = message_segment.data[:100] if message_segment.data else ''
-            else:
-                content_preview = str(message_segment)[:100]
-            
-            logger.info(f"收到来自MaiBot的回复 [消息ID: {message_id}]: {message_segment}")
-            logger.info(f"消息内容预览: {content_preview}")
-            
-            # 提取回复信息：确定接收者
-            receiver = self._resolve_receiver(message_info)
+            info = message.message_info
+            receiver = self._resolve_receiver(info)
             if not receiver:
-                logger.error("无法确定回复接收者。_id_to_name 条数=%d, message_info=%s",
-                             len(self._id_to_name), message_info)
-                return
-            
-            # 处理消息段
-            await self._process_message_segments(message_segment, receiver)
-                
-        except Exception as e:
-            logger.error(f"处理MaiBot回复时发生错误: {str(e)}")
-            # 添加更详细的错误信息
-            import traceback
-            logger.error(f"错误详情: {traceback.format_exc()}")
+                raise ValueError("无法从 receiver_info 或兼容字段解析微信会话")
+            message_id = getattr(info, "message_id", None)
+            logger.info("收到 MaiBot 回复 id=%s segment_type=%s", message_id,
+                        self._segment_value(message.message_segment, "type"))
+            await self._process_segments(message.message_segment, receiver)
+        except Exception:
+            logger.exception("处理 MaiBot 回复失败")
 
-    def _bot_self_nickname(self):
-        """返回机器人自己的微信昵称，用于排除把机器人自己当接收者的情况。
-        优先取 .env 里 WX_BOT_NICKNAME，其次回退到 PLATFORM_ID 之外的常见默认值。"""
-        nick = os.environ.get('WX_BOT_NICKNAME', '').strip()
-        if nick:
-            return nick
-        return None
+    @staticmethod
+    def _segment_value(segment, key, default=None):
+        if isinstance(segment, dict):
+            return segment.get(key, default)
+        return getattr(segment, key, default)
 
-    def _resolve_receiver(self, message_info):
-        """从 MaiBot 回复的 message_info 中确定 wxauto 需要的接收者（群名或私聊昵称）。
-
-        新版麦麦用 sender_info/receiver_info 区分发送方和接收方：
-        - sender_info.user_info 是机器人自己
-        - receiver_info.user_info / receiver_info.group_info 才是真正要回复的对象
-        老版麦麦用 user_info/group_info（user_info 是发送方，回复时即接收方）。
-
-        麦麦回复的 receiver_info 里通常只有 md5 哈希的 user_id/group_id，
-        没有可读昵称，需要用入站时记录的 _id_to_name 反查。
-        """
-        if message_info is None:
-            return None
-
-        receiver = None
-
-        # 1) 优先用新版字段 receiver_info
-        receiver_info = getattr(message_info, 'receiver_info', None)
-        if receiver_info:
-            r_group = getattr(receiver_info, 'group_info', None)
-            if r_group:
-                gname = getattr(r_group, 'group_name', None)
-                gid = getattr(r_group, 'group_id', None)
-                if gname:
-                    receiver = gname
-                elif gid and gid in self._id_to_name:
-                    receiver = self._id_to_name[gid]
-                    logger.info(f"通过 receiver_info.group_id={gid} 反查到群名: {receiver}")
-            if not receiver:
-                r_user = getattr(receiver_info, 'user_info', None)
-                if r_user:
-                    uname = getattr(r_user, 'user_nickname', None)
-                    uid = getattr(r_user, 'user_id', None)
-                    if uname and str(uname).strip():
-                        receiver = uname
-                    elif uid and uid in self._id_to_name:
-                        receiver = self._id_to_name[uid]
-                        logger.info(f"通过 receiver_info.user_id={uid} 反查到昵称: {receiver}")
-
-        # 2) 回退到老版字段 group_info / user_info
-        # 注意：老版 user_info.user_nickname 在回复里可能是机器人自己（如 '麦麦'），要排除
-        if not receiver:
-            group_info = getattr(message_info, 'group_info', None)
-            if group_info:
-                gname = getattr(group_info, 'group_name', None)
-                if gname:
-                    receiver = gname
-        if not receiver:
-            user_info = getattr(message_info, 'user_info', None)
-            if user_info:
-                uname = getattr(user_info, 'user_nickname', None)
-                uid = getattr(user_info, 'user_id', None)
-                if uname and str(uname).strip():
-                    bot_nick = self._bot_self_nickname()
-                    if bot_nick and str(uname).strip() == bot_nick:
-                        logger.warning(f"user_info.user_nickname='{uname}' 是机器人自己，不作为接收者")
-                    else:
-                        receiver = uname
-                elif uid and uid in self._id_to_name:
-                    receiver = self._id_to_name[uid]
-                    logger.info(f"通过 user_info.user_id={uid} 反查到昵称: {receiver}")
-
-        # 3) 兜底：用 additional_config.platform_io_target_user_id 反查
-        # 麦麦回复里通常带 additional_config.platform_io_target_user_id（接收者 md5），
-        # 作为 receiver_info 之外的第二道保险，避免因结构差异丢回复
-        if not receiver:
-            additional_config = getattr(message_info, 'additional_config', None)
-            if additional_config:
-                target_uid = getattr(additional_config, 'platform_io_target_user_id', None)
-                if target_uid and target_uid in self._id_to_name:
-                    receiver = self._id_to_name[target_uid]
-                    logger.info(f"通过 additional_config.platform_io_target_user_id={target_uid} 反查到昵称: {receiver}")
-
-        return receiver
-
-    def _ensure_chatwnd(self, wechat, receiver):
-        """确保 receiver 有独立聊天窗口(ChatWnd)并返回 FindWindow 句柄。
-
-        这个 wxauto 版本的 SendMsg/ChatWnd 只能对「独立弹出的聊天窗口」操作，
-        主窗口里的聊天标签页发不了消息。没有独立窗口时，需要：
-        1. ChatWith 切到主窗口该聊天
-        2. 双击会话列表项弹出独立窗口
-        （参考 wxauto.AddListenChat 的实现）
-        返回 True 表示独立窗口已就绪，False 表示无法弹出。
-
-        注意：双击后独立窗口不会立即出现，需要轮询等待（最多5秒）。
-        之前只 sleep(1) 检查一次，新对象窗口弹出慢时会误判失败，
-        导致第一条回复被丢弃（表现为"第一句不回，发两句只回第二句"）。
-        """
-        from wxauto.utils import FindWindow
-        if FindWindow(name=receiver, classname='ChatWnd'):
-            return True
-        try:
-            logger.info(f"{receiver!r} 无独立聊天窗口，尝试弹出独立窗口")
-            wechat.ChatWith(receiver)
-            wechat.SessionBox.ListItemControl(RegexName=receiver).DoubleClick(simulateMove=False)
-            # 轮询等待独立窗口出现，最多5秒（新对象窗口弹出可能需要2-3秒）
-            import time
-            for i in range(10):
-                time.sleep(0.5)
-                if FindWindow(name=receiver, classname='ChatWnd'):
-                    logger.info(f"✅ 已弹出 {receiver!r} 的独立聊天窗口（等待{(i+1)*0.5:.1f}s）")
-                    return True
-            logger.error(f"❌ 弹出 {receiver!r} 独立窗口失败（等待5s未出现）")
-            return False
-        except Exception as e:
-            logger.error(f"❌ 弹出 {receiver!r} 独立窗口异常: {e}")
-            return False
-
-    def _send_text_cached(self, wechat, receiver, content):
-        """通过缓存的轻量 ChatWnd 实例发送文字消息。
-
-        用 _SendOnlyChatWnd（跳过 GetAllMessage）替代原版 ChatWnd，
-        首次发送从 ~10s 压到 ~1s。缓存后后续发送复用实例，更快。
-        对没有独立聊天窗口的新对象，会先弹出独立窗口。
-        """
-        from wxauto.utils import FindWindow
-
-        # 1) 确保独立聊天窗口存在
-        if not self._ensure_chatwnd(wechat, receiver):
-            logger.error(f"{receiver!r} 无法建立独立聊天窗口，发送失败")
+    async def _process_segments(self, segment, receiver):
+        seg_type = str(self._segment_value(segment, "type", "")).lower()
+        data = self._segment_value(segment, "data")
+        if seg_type == "seglist":
+            for child in data or []:
+                await self._process_segments(child, receiver)
             return
-
-        # 2) 获取/创建缓存的 ChatWnd 实例
-        chatwnd = self._chatwnd_cache.get(receiver)
-        if chatwnd is None:
-            logger.info(f"首次发送到 {receiver!r}，创建轻量 ChatWnd 实例")
-            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
-            self._chatwnd_cache[receiver] = chatwnd
-
-        # 3) 发送，失败则重建一次
-        try:
-            chatwnd.SendMsg(content)
-        except Exception as e:
-            logger.warning(f"缓存的 ChatWnd 发送失败({e})，清除缓存重试")
-            self._chatwnd_cache.pop(receiver, None)
-            if not self._ensure_chatwnd(wechat, receiver):
-                logger.error(f"重试失败：{receiver!r} 的独立聊天窗口已不存在")
-                return
-            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
-            self._chatwnd_cache[receiver] = chatwnd
-            chatwnd.SendMsg(content)
-
-    def _send_file_cached(self, wechat, receiver, filepath):
-        """通过缓存的轻量 ChatWnd 实例发送文件/图片。
-
-        原版 wechat.SendFiles(filepath, receiver) 有两个问题：
-        1. 内部 if FindWindow(name=who, classname='ChatWnd') 不存在就 return False，
-           没有独立聊天窗口时图片静默丢失（不报错）
-        2. 内部 chat = ChatWnd(who) 会调 GetAllMessage() 读取全部聊天记录（10s+）
-        改用缓存实例 + _ensure_chatwnd 弹窗，保证图片能发出且快速。
-        """
-        # 1) 确保独立聊天窗口存在
-        if not self._ensure_chatwnd(wechat, receiver):
-            logger.error(f"{receiver!r} 无法建立独立聊天窗口，文件发送失败: {filepath}")
+        if seg_type in {"reply", "notify"}:
             return
-        # 2) 获取/创建缓存的 ChatWnd 实例
-        chatwnd = self._chatwnd_cache.get(receiver)
-        if chatwnd is None:
-            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
-            self._chatwnd_cache[receiver] = chatwnd
-        # 3) 发送，失败则重建一次
-        try:
-            chatwnd.SendFiles(filepath)
-        except Exception as e:
-            logger.warning(f"缓存的 ChatWnd 发送文件失败({e})，清除缓存重试")
-            self._chatwnd_cache.pop(receiver, None)
-            if not self._ensure_chatwnd(wechat, receiver):
-                logger.error(f"重试失败：{receiver!r} 的独立聊天窗口已不存在")
-                return
-            chatwnd = _SendOnlyChatWnd(receiver, wechat.language)
-            self._chatwnd_cache[receiver] = chatwnd
-            chatwnd.SendFiles(filepath)
-
-    async def _process_message_segments(self, message_segment, receiver):
-        """递归处理消息段，支持多段消息"""
-        try:
-            if hasattr(message_segment, 'type'):
-                if message_segment.type == "seglist":
-                    # 多段消息，递归处理每个段
-                    logger.info(f"处理多段消息，共{len(message_segment.data)}段")
-                    for segment in message_segment.data:
-                        await self._process_message_segments(segment, receiver)
-                elif message_segment.type == "text":
-                    # 文字消息
-                    reply_content = message_segment.data
-                    await self._send_to_wechat(receiver, reply_content)
-                    logger.info(f"已处理文字消息: {reply_content[:50]}...")
-                elif message_segment.type == "image":
-                    # 图片消息
-                    image_path = message_segment.data
-                    await self._send_to_wechat(receiver, image_path)
-                    logger.info(f"已处理图片消息")
-                elif message_segment.type == "file":
-                    # 文件消息
-                    file_path = message_segment.data
-                    await self._send_to_wechat(receiver, file_path)
-                    logger.info(f"已处理文件消息")
-                elif message_segment.type == "emoji":
-                    # 表情包消息
-                    emoji_data = message_segment.data
-                    await self._send_to_wechat(receiver, emoji_data)
-                    logger.info(f"已处理表情包消息")
-                elif message_segment.type == "reply":
-                    # 回复引用消息，只记录日志，不发送到微信
-                    logger.info(f"跳过回复引用消息: {message_segment.data}")
-                elif message_segment.type == "at":
-                    # @消息，转换为文字格式
-                    at_content = f"[@{message_segment.data}]"
-                    await self._send_to_wechat(receiver, at_content)
-                    logger.info(f"已处理@消息: {at_content}")
-                elif message_segment.type == "voice":
-                    # 语音消息，发送提示文字
-                    voice_content = "[发了一段语音，网卡了加载不出来]"
-                    await self._send_to_wechat(receiver, voice_content)
-                    logger.info(f"已处理语音消息")
-                elif message_segment.type == "notify":
-                    # 通知消息，通常不需要发送到微信
-                    logger.info(f"跳过通知消息: {message_segment.data}")
-                else:
-                    # 其他类型消息，尝试作为文字发送
-                    reply_content = str(message_segment.data)
-                    await self._send_to_wechat(receiver, reply_content)
-                    logger.info(f"已处理其他类型消息: {message_segment.type}")
-            else:
-                # 如果没有type属性，尝试直接发送数据
-                reply_content = str(message_segment.data)
-                await self._send_to_wechat(receiver, reply_content)
-                logger.info(f"已处理无类型消息")
-                
-        except Exception as e:
-            logger.error(f"处理消息段时发生错误: {str(e)}")
-            import traceback
-            logger.error(f"错误详情: {traceback.format_exc()}")
-    
-    async def _send_to_wechat(self, receiver, content):
-        """发送消息到微信（添加到队列，确保按顺序发送）"""
-        try:
-            # 检查队列是否已初始化
-            if self.send_queue is None:
-                logger.warning("消息发送队列未初始化，直接发送消息")
-                await self._send_to_wechat_sync(receiver, content)
-                return
-            
-            # 将消息添加到发送队列
-            await self.send_queue.put((receiver, content))
-            logger.info(f"消息已添加到发送队列: {receiver} - {content[:50]}...")
-        except Exception as e:
-            logger.error(f"添加消息到发送队列失败: {str(e)}")
-            # 如果队列失败，尝试直接发送
+        if seg_type == "image":
+            path, temporary = self._prepare_image(data)
             try:
-                await self._send_to_wechat_sync(receiver, content)
-            except Exception as e2:
-                logger.error(f"直接发送消息也失败: {str(e2)}")
-    
-    async def _send_to_wechat_sync(self, receiver, content):
-        """实际执行发送消息到微信的操作"""
-        try:
-            def send_message():
-                try:
-                    # 发送线程也需要 COM 初始化（UIA 操作依赖）
+                await self._queue_outbound(receiver, "image", path)
+            finally:
+                if temporary:
                     try:
-                        import pythoncom
-                        pythoncom.CoInitialize()
-                    except ImportError:
-                        pass
+                        os.unlink(path)
+                    except OSError:
+                        logger.warning("临时图片清理失败 path=%s", path, exc_info=True)
+            return
+        if seg_type == "file":
+            path = self._normalize_file(data)
+            await self._queue_outbound(receiver, "file", path)
+            return
+        if seg_type == "at":
+            data = f"[@{self._text(data)}]"
+        elif seg_type == "voice":
+            data = "[语音消息]"
+        elif seg_type not in {"text", "emoji"}:
+            logger.error("拒绝未知消息段 type=%s", seg_type)
+            return
+        text = self._text(data)
+        if text:
+            await self._queue_outbound(receiver, "text", text)
 
-                    # 复用 wx_Listener.py 里的全局 wx 实例，避免每次发送都新建
-                    # WeChat() 实例（新建会重复做 UIA 查找窗口、COM 初始化，
-                    # 多实例同时操作同一微信窗口会冲突导致发送失败）
-                    from wx_Listener import wx as wechat
-                    import base64
-                    import tempfile
-                    import os
+    async def _queue_outbound(self, receiver, kind, data):
+        completion = asyncio.get_running_loop().create_future()
+        try:
+            await asyncio.wait_for(
+                self._send_queue.put((receiver, kind, data, completion)), timeout=2
+            )
+        except asyncio.TimeoutError as exc:
+            self._dead_letters.append({"receiver": receiver, "type": kind, "error": "queue full"})
+            raise RuntimeError("微信发送队列已满") from exc
+        await completion
 
-                    if wechat is None:
-                        raise RuntimeError("全局 wxauto.WeChat 实例未初始化")
+    @staticmethod
+    def _text(value):
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace").strip()
+        if isinstance(value, str):
+            return value.strip()
+        return json.dumps(value, ensure_ascii=False, default=str).strip()
 
-                    # 诊断：打印 receiver 的确切值和类型
-                    logger.info(f"开始发送到微信: receiver={receiver!r} (type={type(receiver).__name__}), content={str(content)[:80]}")
+    def _prepare_image(self, data):
+        if isinstance(data, dict):
+            data = data.get("base64") or data.get("path")
+        if not isinstance(data, str) or not data:
+            raise ValueError("image segment 缺少字符串 data")
+        if os.path.isfile(data):
+            if os.path.getsize(data) > MAX_MEDIA_BYTES:
+                raise ValueError("图片超过尺寸上限")
+            with open(data, "rb") as stream:
+                self._validate_image(stream.read(16))
+            return data, False
+        encoded = data.split(",", 1)[1] if data.startswith("data:image/") and "," in data else data
+        if len(encoded) > ((MAX_MEDIA_BYTES + 2) // 3) * 4 + 8:
+            raise ValueError("base64 图片超过尺寸上限")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("无效 base64 图片") from exc
+        if len(raw) > MAX_MEDIA_BYTES:
+            raise ValueError("图片超过尺寸上限")
+        suffix = self._validate_image(raw[:16])
+        fd, path = tempfile.mkstemp(prefix="wemai_", suffix=suffix)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+        return path, True
 
-                    # 检查是否是base64编码的图片数据
-                    # 注意：仅凭"长+字母数字"判断会误判长英文文本。
-                    # 额外要求：长度是4的倍数（base64特征）且无明显空格/换行（base64不含空白）
-                    def _looks_like_base64(s):
-                        if s.startswith('data:image/'):
-                            return True
-                        if len(s) < 1000:
-                            return False
-                        # base64 不含空格、换行等空白字符
-                        if any(c.isspace() for c in s):
-                            return False
-                        # base64 长度必须是4的倍数
-                        if len(s) % 4 != 0:
-                            return False
-                        # 只允许 base64 字符集
-                        import re
-                        return bool(re.match(r'^[A-Za-z0-9+/]+=*$', s))
+    @staticmethod
+    def _validate_image(header):
+        for magic, suffix in _IMAGE_MAGIC.items():
+            if header.startswith(magic):
+                if magic == b"RIFF" and header[8:12] != b"WEBP":
+                    continue
+                return suffix
+        raise ValueError("不支持或伪造的图片格式")
 
-                    if isinstance(content, str) and _looks_like_base64(content):
-                        # 可能是base64编码的图片
-                        try:
-                            # 尝试解码base64数据
-                            file_extension = '.png'  # 默认扩展名
-                            if content.startswith('data:image/'):
-                                # 处理data URL格式，提取文件类型
-                                header, encoded = content.split(",", 1)
-                                if 'gif' in header.lower():
-                                    file_extension = '.gif'
-                                elif 'jpeg' in header.lower() or 'jpg' in header.lower():
-                                    file_extension = '.jpg'
-                                elif 'png' in header.lower():
-                                    file_extension = '.png'
-                                image_data = base64.b64decode(encoded)
-                            else:
-                                # 处理纯base64编码，尝试检测文件类型
-                                image_data = base64.b64decode(content)
-                                # 检查GIF文件头
-                                if image_data.startswith(b'GIF8'):
-                                    file_extension = '.gif'
-                                # 检查JPEG文件头
-                                elif image_data.startswith(b'\xff\xd8\xff'):
-                                    file_extension = '.jpg'
-                                # 检查PNG文件头
-                                elif image_data.startswith(b'\x89PNG'):
-                                    file_extension = '.png'
+    @staticmethod
+    def _normalize_file(data):
+        if isinstance(data, dict):
+            data = data.get("path")
+        if not isinstance(data, str) or not os.path.isfile(data):
+            raise ValueError("file segment 必须是存在的本地文件路径")
+        if os.path.getsize(data) > MAX_MEDIA_BYTES:
+            raise ValueError("文件超过尺寸上限")
+        return data
 
-                            # 创建临时文件，使用正确的扩展名
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-                                temp_file.write(image_data)
-                                temp_file_path = temp_file.name
-
-                            # 发送图片文件（走缓存 ChatWnd，避免静默失败 + 慢）
-                            logger.info(f"通过缓存实例发送 base64 图片: {receiver}")
-                            self._send_file_cached(wechat, receiver, temp_file_path)
-                            logger.info(f"已发送base64图片到微信: {receiver}")
-
-                            # 删除临时文件
-                            try:
-                                os.unlink(temp_file_path)
-                            except:
-                                pass
-
-                        except Exception as e:
-                            logger.error(f"处理base64图片失败: {str(e)}")
-                            # 如果base64解码失败，尝试作为文字发送
-                            logger.info(f"base64解码失败，改发文字: {receiver}")
-                            self._send_text_cached(wechat, receiver, content)
-                            logger.info(f"已发送文字内容: {receiver} - {content[:50]}...")
-
-                    # 检查是否是图片/表情包路径
-                    # 注意：不再把 "[xxx]" 格式当图片路径（表情如 [微笑] 会误判），
-                    # 只认以图片扩展名结尾且文件真实存在的路径
-                    elif isinstance(content, str) and content.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
-                        # 如果是图片路径，使用缓存的 SendFiles 发送
-                        if os.path.exists(content):
-                            logger.info(f"通过缓存实例发送图片文件: {receiver} - {content}")
-                            self._send_file_cached(wechat, receiver, content)
-                            logger.info(f"已发送图片到微信: {receiver} - {content}")
-                        else:
-                            # 如果文件不存在，尝试发送文字内容
-                            logger.info(f"图片文件不存在，改发文字: {receiver}")
-                            self._send_text_cached(wechat, receiver, content)
-                            logger.info(f"已发送文字内容: {receiver} - {content}")
-                    else:
-                        # 普通文字消息
-                        # 优化：缓存 ChatWnd 实例。wechat.SendMsg 每次都新建 ChatWnd(receiver)，
-                        # 而 ChatWnd.__init__ 会调 GetAllMessage() 读取全部聊天记录（很慢，10s+）。
-                        # 缓存后只有第一次需要读全部记录，后续发送复用实例，大幅降低延迟。
-                        logger.info(f"调用发送文字消息: receiver={receiver}")
-                        self._send_text_cached(wechat, receiver, content)
-                        logger.info(f"✅ 已发送文字消息到微信: {receiver} - {content}")
-
-                except Exception as e:
-                    logger.error(f"❌ 发送微信消息失败: {str(e)}")
-                    import traceback
-                    logger.error(f"错误详情: {traceback.format_exc()}")
-                    raise e
-
-            # 在默认线程池中执行并等待完成
-            # 之前每次都新建 ThreadPoolExecutor，创建/销毁开销大且可能泄漏线程
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, send_message)
-
-        except Exception as e:
-            logger.error(f"发送微信消息时发生错误: {str(e)}")
-    
     def process_message(self, chat_name, message_data):
-        """
-        处理微信消息并转发到 MaiBot
-        
-        Args:
-            chat_name (str): 聊天对象名称
-            message_data (dict): 消息数据，包含 sender, content, type, timestamp 等信息
-        
-        Returns:
-            dict: MaiBot 的响应结果
-        """
+        if not self.inbound_enabled:
+            return {"success": False, "error": "微信到 MaiBot 方向已禁用"}
+        if not self.ready_event.is_set() or self.startup_error or not self._loop:
+            return {"success": False, "error": "Router 未就绪"}
         try:
-            # 记录接收到的消息
-            logger.info(f"处理消息: {chat_name} - {message_data['sender']}: {message_data['content']}")
-            
-            # 构建 MaiBot 消息体
-            maibot_message = self._build_maibot_message(chat_name, message_data)
-            
-            # 发送消息到 MaiBot
-            response = self._send_to_maibot(maibot_message)
-            
-            return response
-        except Exception as e:
-            logger.error(f"处理消息时发生错误: {str(e)}")
-            return {"success": False, "error": str(e)}
-    
-    def _is_image_path_message(self, content: str) -> bool:
-        """
-        检查是否是图片路径消息
-        
-        Args:
-            content (str): 消息内容
-        
-        Returns:
-            bool: 是否是图片路径消息
-        """
-        if not content:
-            return False
-        
-        # 检查是否包含图片路径特征
-        has_path_separator = '\\' in content or '/' in content
-        has_image_extension = any(ext in content.lower() for ext in ['.jpg', '.png', '.gif', '.bmp', '.jpeg'])
-        has_wxauto_path = 'wxauto文件' in content or '微信图片_' in content
-        
-        return (has_path_separator and has_image_extension) or has_wxauto_path
+            message = self._build_message(chat_name, message_data)
+            future = asyncio.run_coroutine_threadsafe(self.router.send_message(message), self._loop)
+            future.result(timeout=10)
+            info = message.message_info
+            logger.info("已转发至 MaiBot id=%s type=%s",
+                        info.message_id, message.message_segment.type)
+            return {"success": True}
+        except Exception as exc:
+            logger.error("转发至 MaiBot 失败: %s", exc)
+            return {"success": False, "error": str(exc)}
 
-    def _build_maibot_message(self, chat_name, message_data):
-        """
-        构建 MaiBot 消息体
-        
-        Args:
-            chat_name (str): 聊天对象名称
-            message_data (dict): 消息数据
-        
-        Returns:
-            dict: MaiBot 格式的消息体
-        """
-        # 提取消息信息
-        sender = message_data['sender']
-        content = message_data['content']
-        msg_type = message_data['type']
-        timestamp = time.time()  # 使用当前时间戳
-        
-        # 判断是群聊还是私聊
-        is_group_chat = not (chat_name == sender)
-        
-        # 生成包含用户特征的消息 ID
-        # 结合发送者、聊天名称、时间戳和消息内容前20个字符生成哈希
-        id_source = f"{sender}_{chat_name}_{timestamp}_{content[:20]}"
-        message_id = hashlib.md5(id_source.encode('utf-8')).hexdigest()
-        
-        # 使用 MD5 哈希生成用户ID和群组ID
-        user_id_hash = hashlib.md5(sender.encode('utf-8')).hexdigest()
-
-        # 记录 md5 → 可读昵称 映射，出站时麦麦回复的 receiver_info
-        # 里只有 md5 哈希没有可读昵称，需要用这个反查
-        self._id_to_name[user_id_hash] = sender
-        
-        # 构建基本消息信息
-        message_info = {
-            "platform": self.platform,
-            "message_id": message_id,
-            "time": timestamp,
-            "format_info": {
-                "content_format": "text",
-                "accept_format": "text,emoji"
-            }
-        }
-        
-        # 添加用户信息
-        message_info["user_info"] = {
-            "platform": self.platform,
-            "user_id": user_id_hash,  # 使用哈希后的用户ID
-            "user_nickname": sender
-        }
-        
-        # 如果是群聊，添加群组信息
-        if is_group_chat:
-            # 使用 MD5 哈希生成群组ID
-            group_id_hash = hashlib.md5(chat_name.encode('utf-8')).hexdigest()
-
-            # 记录群组 md5 → 可读群名 映射
-            self._id_to_name[group_id_hash] = chat_name
-
-            message_info["group_info"] = {
-                "platform": self.platform,
-                "group_id": group_id_hash,  # 使用哈希后的群组ID
-                "group_name": chat_name
-            }
-            # 在群聊中，添加用户的群昵称
-            message_info["user_info"]["user_cardname"] = sender
-        
-        # 构建消息段
-        # 检查是否启用图像识别功能
-        import os
-        image_recognition_enabled = os.getenv('IMAGE_RECOGNITION_ENABLED', 'true').lower() == 'true'
-        
-        # 检查是否是图片路径消息且启用了图像识别
-        if image_recognition_enabled and self._is_image_path_message(content):
-            # 如果是图片路径，读取图片并转换为base64
-            try:
-                import base64
-                import os
-                
-                if os.path.exists(content):
-                    with open(content, 'rb') as f:
-                        image_data = f.read()
-                    image_base64 = base64.b64encode(image_data).decode('utf-8')
-                    
-                    # 发送image类型的消息
-                    message_segment = {
-                        "type": "image",
-                        "data": image_base64
-                    }
-                    logger.info(f"检测到图片路径，发送image类型消息: {content}")
-                else:
-                    # 文件不存在，发送文本消息
-                    message_segment = {
-                        "type": "text",
-                        "data": f"[图片文件不存在: {content}]"
-                    }
-                    logger.warning(f"图片文件不存在: {content}")
-            except Exception as e:
-                # 读取失败，发送文本消息
-                message_segment = {
-                    "type": "text",
-                    "data": f"[图片读取失败: {content}, 错误: {str(e)}]"
-                }
-                logger.error(f"图片读取失败: {content}, 错误: {e}")
+    def _build_message(self, chat_name, data):
+        chat_name = self._text(chat_name)
+        sender_name = self._text(data.get("sender")) or "未知用户"
+        content = self._text(data.get("content"))
+        chat_type = data.get("chat_type")
+        if chat_type not in {"private", "group"}:
+            raise ValueError(f"缺少可靠 chat_type: {chat_type!r}")
+        message_id = hashlib.md5(
+            f"{self.platform}|message|{chat_type}|{chat_name}|{sender_name}|{data.get('timestamp')}|{content}".encode()
+        ).hexdigest()
+        user_id = self._stable_id(
+            chat_type, chat_name if chat_type == "private" else f"{chat_name}|{sender_name}"
+        )
+        user = UserInfo(platform=self.platform, user_id=user_id,
+                        user_nickname=sender_name,
+                        user_cardname=sender_name if chat_type == "group" else None)
+        bot = UserInfo(platform=self.platform,
+                       user_id=self._stable_id("bot", WX_BOT_NICKNAME or "self"),
+                       user_nickname=WX_BOT_NICKNAME or "WeMai")
+        group = None
+        if chat_type == "group":
+            group_id = self._stable_id("group", chat_name)
+            group = GroupInfo(platform=self.platform, group_id=group_id, group_name=chat_name)
+            self._remember(group_id, chat_name, "group")
         else:
-            # 普通文本消息
-            message_segment = {
-                "type": "text",
-                "data": content
-            }
-        
-        # 组合完整消息体 - 按照maim_message库的格式
-        maibot_message = {
-            "message_info": message_info,
-            "message_segment": message_segment,
-            "raw_message": None  # 添加raw_message字段
-        }
-        
-        return maibot_message
-    
-    def _send_to_maibot(self, message):
-        """
-        发送消息到 MaiBot API
-        
-        Args:
-            message (dict): MaiBot 格式的消息体
-        
-        Returns:
-            dict: API 响应结果
-        """
-        try:
-            # 记录发送的消息
-            logger.info(f"发送消息到 MaiBot: {json.dumps(message, ensure_ascii=False)}")
-            logger.info(f"请求URL: {MAIBOT_API_URL}")
-            
-            # 使用Router发送消息
-            if self.router:
-                message_base = self._dict_to_message_base(message)
-                
-                # router.send_message 复用 Router 的 WebSocket 连接，必须在
-                # Router 所在的事件循环上执行。之前用 asyncio.run 创建新循环，
-                # 跨循环访问 socketio.AsyncClient 会抛
-                # "Future attached to a different loop"（不可靠）。
-                # 改用 run_coroutine_threadsafe 把协程投递到 Router 的循环。
-                router_loop = getattr(self, '_router_loop', None)
-                if router_loop is not None and router_loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.router.send_message(message_base),
-                        router_loop
-                    )
-                    # 等待发送完成，超时10秒避免监听线程被永久阻塞
-                    future.result(timeout=10)
-                else:
-                    # Router 循环未就绪，回退到 asyncio.run（首次启动竞态等极端情况）
-                    logger.warning("Router 事件循环未就绪，回退到 asyncio.run")
-                    asyncio.run(self.router.send_message(message_base))
-                
-                return {"success": True, "data": "消息已发送"}
+            self._remember(user_id, chat_name, "private")
+        sender = SenderInfo(group_info=group, user_info=user)
+        receiver = ReceiverInfo(group_info=group, user_info=None if group else bot)
+        segment = self._inbound_segment(content)
+        format_info = FormatInfo(content_format=["text"], accept_format=["text", "emoji"])
+        info = BaseMessageInfo(
+            platform=self.platform, message_id=message_id, time=time.time(),
+            group_info=group, user_info=user, format_info=format_info, template_info=None,
+            additional_config=None, sender_info=sender, receiver_info=receiver,
+        )
+        return MessageBase(message_info=info, message_segment=segment, raw_message=content or None)
+
+    def _inbound_segment(self, content):
+        if IMAGE_RECOGNITION_ENABLED and content and os.path.isfile(content):
+            size = os.path.getsize(content)
+            if size > MAX_MEDIA_BYTES:
+                raise ValueError("入站图片超过尺寸上限")
+            raw = Path(content).read_bytes()
+            self._validate_image(raw[:16])
+            return Seg(type="image", data=base64.b64encode(raw).decode("ascii"))
+        return Seg(type="text", data=content)
+
+    def _stable_id(self, chat_type, identifier):
+        value = f"{self.platform}|{chat_type}|{identifier}"
+        return hashlib.md5(value.encode("utf-8")).hexdigest()
+
+    def _remember(self, identifier, name, chat_type):
+        with self._id_lock:
+            self._id_to_name[identifier] = {"name": name, "type": chat_type, "updated": time.time()}
+            self._save_id_map()
+
+    def _resolve_receiver(self, info):
+        if info is None:
+            return None
+        candidates = []
+        receiver = getattr(info, "receiver_info", None)
+        if receiver:
+            candidates.extend((getattr(receiver, "group_info", None),
+                               getattr(receiver, "user_info", None)))
+        candidates.extend((getattr(info, "group_info", None), getattr(info, "user_info", None)))
+        for value in candidates:
+            if not value:
+                continue
+            identifier = getattr(value, "group_id", None) or getattr(value, "user_id", None)
+            name = getattr(value, "group_name", None) or getattr(value, "user_nickname", None)
+            if identifier:
+                mapped = self._id_to_name.get(identifier)
+                if mapped:
+                    return mapped["name"] if isinstance(mapped, dict) else mapped
+            if name and name != WX_BOT_NICKNAME:
+                return name
+        config = getattr(info, "additional_config", None)
+        target = None
+        if config:
+            if isinstance(config, dict):
+                target = config.get("platform_io_target_user_id")
             else:
-                logger.error("Router未初始化")
-                return {"success": False, "error": "Router未初始化"}
-        
-        except Exception as e:
-            logger.error(f"与 MaiBot 通信时发生未知错误: {str(e)}")
-            return {"success": False, "error": str(e)}
-    
-    def _dict_to_message_base(self, message_dict):
-        """将字典消息转换为MessageBase对象"""
+                target = getattr(config, "platform_io_target_user_id", None)
+        mapped = self._id_to_name.get(target)
+        return (mapped.get("name") if isinstance(mapped, dict) else mapped) if mapped else None
+
+    def _load_id_map(self):
         try:
-            # 提取消息信息
-            message_info_dict = message_dict["message_info"]
-            message_segment_dict = message_dict["message_segment"]
-            
-            # 构建用户信息
-            user_info = UserInfo(
-                platform=message_info_dict["user_info"]["platform"],
-                user_id=message_info_dict["user_info"]["user_id"],
-                user_nickname=message_info_dict["user_info"]["user_nickname"]
-            )
-            
-            # 构建群组信息（如果有）
-            group_info = None
-            if "group_info" in message_info_dict:
-                group_info = GroupInfo(
-                    platform=message_info_dict["group_info"]["platform"],
-                    group_id=message_info_dict["group_info"]["group_id"],
-                    group_name=message_info_dict["group_info"]["group_name"]
-                )
-            
-            # 构建消息段
-            message_segment = Seg(
-                type=message_segment_dict["type"],
-                data=message_segment_dict["data"]
-            )
-            
-            # 构建消息信息
-            message_info = BaseMessageInfo(
-                platform=message_info_dict["platform"],
-                message_id=message_info_dict["message_id"],
-                time=message_info_dict["time"],
-                user_info=user_info,
-                group_info=group_info,
-                format_info=message_info_dict["format_info"]
-            )
-            
-            # 构建MessageBase对象
-            message_base = MessageBase(
-                message_info=message_info,
-                message_segment=message_segment,
-                raw_message=message_dict.get("raw_message")
-            )
-            
-            return message_base
-            
-        except Exception as e:
-            logger.error(f"转换消息格式失败: {str(e)}")
-            raise e
-    
+            with open(ID_MAP_FILE, "r", encoding="utf-8") as stream:
+                value = json.load(stream)
+            if isinstance(value, dict):
+                self._id_to_name = value
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            logger.warning("ID 映射读取失败，将使用空映射", exc_info=True)
 
-    
-
-
-
-# 示例：如何使用消息处理器
-if __name__ == "__main__":
-    # 创建消息处理器实例
-    processor = MessageProcessor()
-    
-    # 模拟消息数据
-    chat_name = "测试群"
-    message_data = {
-        "sender": "张三",
-        "content": "你好，机器人",
-        "type": "friend",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    
-    # 处理消息
-    result = processor.process_message(chat_name, message_data)
-    print(f"处理结果: {result}")
+    def _save_id_map(self):
+        path = Path(ID_MAP_FILE)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(self._id_to_name, stream, ensure_ascii=False, indent=2)
+            os.replace(temporary, path)
+        except OSError:
+            logger.error("ID 映射持久化失败 path=%s", path, exc_info=True)

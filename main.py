@@ -1,246 +1,168 @@
 import argparse
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import signal
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 
-# 导入各个组件
-# 新版麦麦用 WebSocket 双向通信，Router 在 wx_Processer 里同时处理
-# 入站（微信→麦麦）和出站（麦麦→微信），不再需要 mq_Producer/mq_Consumer
-# 的 Redis 队列中转，因此移除了这两个组件的启动逻辑。
-from wx_Listener import WeChatListener, message_callback, set_global_processor, create_message_processor
-from config import WX_TARGET_CHATS, LOG_LEVEL, LOG_FORMAT, LOG_DATE_FORMAT, LOG_FILE
-
-# 配置日志
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format=LOG_FORMAT,
-    datefmt=LOG_DATE_FORMAT,
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, encoding='utf-8')
-    ]
+from config import (
+    LOG_BACKUP_COUNT,
+    LOG_DATE_FORMAT,
+    LOG_FILE,
+    LOG_FORMAT,
+    LOG_LEVEL,
+    LOG_MAX_BYTES,
+    WX_LISTEN_ALL_IF_EMPTY,
+    WX_TARGET_CHATS,
+    _parse_list,
+)
+from wx_Listener import (
+    UICommandQueue,
+    WeChatListener,
+    create_message_processor,
+    message_callback,
+    set_global_processor,
 )
 
 logger = logging.getLogger(__name__)
+stop_event = threading.Event()
 
-# 全局变量
-stop_event = Event()
-signal_handled = False
 
-# 微信监听器进程
-def run_wx_listener(target_chats=None):
-    """
-    运行微信消息监听器（在子线程中运行，由 ThreadPoolExecutor 调度）。
+def configure_logging():
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(getattr(logging, LOG_LEVEL))
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+    stream = logging.StreamHandler()
+    stream.setFormatter(formatter)
+    rotating = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES,
+                                   backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+    rotating.setFormatter(formatter)
+    root.addHandler(stream)
+    root.addHandler(rotating)
 
-    同时承担入站（微信→麦麦）和出站（麦麦→微信）：
-    - 入站：监听微信消息 → message_callback → MessageProcessor → WebSocket → 麦麦
-    - 出站：Router(WebSocket) 接收麦麦回复 → _handle_maibot_response → wx.SendMsg → 微信
 
-    wxauto 的 UIA 操作需要 COM 初始化，子线程默认不初始化，
-    必须先调用 pythoncom.CoInitialize()。
-
-    失败时用 while 循环重试（不递归），避免：
-    1. 递归深度过大导致栈溢出
-    2. 旧 Router daemon 线程未清理就启动新的，导致多个 WebSocket 连接并存
-    重试有上限（10次），超过则放弃，让主进程退出而非无限重启。
-    
-    Args:
-        target_chats (list, optional): 要监听的聊天对象列表
-    """
-    # 子线程使用 COM（UIAutomation）前必须先初始化
+def run_ui_worker(target_chats, commands, inbound_enabled, state):
+    """Create and use all COM/UIA objects in this one dedicated thread."""
+    pythoncom = None
+    uia = None
+    listener = None
     try:
-        import pythoncom
-        pythoncom.CoInitialize()
-        logger.info("COM 已初始化（监听线程）")
-    except ImportError:
-        logger.warning("pythoncom 不可用，跳过 COM 初始化（UIA 可能报错）")
-
-    MAX_RESTART = 10  # 最大重启次数，超过则放弃（避免无限重启死循环）
-    restart_count = 0
-
-    while restart_count < MAX_RESTART and not stop_event.is_set():
         try:
-            logger.info(f"启动微信消息监听器...（第 {restart_count + 1} 次启动）")
-            
-            # 初始化全局消息处理器
-            processor = create_message_processor()
-            set_global_processor(processor)
-            logger.info("全局消息处理器已初始化")
-            
-            # 启动Router（在后台线程中运行，处理与麦麦的 WebSocket 双向通信）
-            import threading
-            router_thread = threading.Thread(target=processor.start_router)
-            router_thread.daemon = True
-            router_thread.start()
-            logger.info("Router已启动")
-            
-            # 显示监听的聊天对象及其哈希值，便于配置MaiBot的白名单
-            if target_chats:
-                import hashlib
-                logger.info("监听的聊天对象及其ID哈希值（请将需要的群组ID添加到MaiBot的白名单中）：")
-                for chat in target_chats:
-                    chat_id = hashlib.md5(chat.encode('utf-8')).hexdigest()
-                    logger.info(f"  {chat} -> {chat_id}")
-            
-            listener = WeChatListener(
-                target_chats=target_chats,
-                callback=message_callback
-            )
-            
-            # 注册停止事件处理
-            def check_stop():
-                while not stop_event.is_set():
-                    time.sleep(1)
-                listener.stop_listening()
-            
-            # 启动停止检查线程
-            stop_thread = threading.Thread(target=check_stop)
-            stop_thread.daemon = True
-            stop_thread.start()
-            
-            # 开始监听（阻塞直到异常或停止）
-            listener.start_listening()
-            
-            # 正常退出循环（start_listening 返回而非抛异常）
-            break
-            
-        except Exception as e:
-            restart_count += 1
-            logger.error(f"微信监听器发生错误: {str(e)}（第 {restart_count}/{MAX_RESTART} 次重启）")
-            if stop_event.is_set():
-                break
-            if restart_count >= MAX_RESTART:
-                logger.error(f"❌ 已达最大重启次数 {MAX_RESTART}，放弃重启")
-                break
-            logger.info(f"等待5秒后重试...")
-            time.sleep(5)
-
-    if restart_count >= MAX_RESTART:
-        logger.error("微信监听器重启次数耗尽，设置停止事件通知主进程退出")
-        stop_event.set()
-
-# 信号处理函数
-def handle_signal(sig, frame):
-    """处理终止信号"""
-    # 防止重复处理信号
-    global signal_handled
-    if signal_handled:
-        return
-    
-    signal_handled = True
-    logger.info(f"收到信号 {sig}，正在优雅停止...")
-    stop_event.set()
-    
-    # 设置强制退出定时器（30秒后强制退出）
-    def force_exit():
-        logger.warning("程序未能在30秒内正常退出，强制终止...")
-        import os
-        os._exit(1)
-    
-    import threading
-    force_timer = threading.Timer(30.0, force_exit)
-    force_timer.daemon = True
-    force_timer.start()
-
-# 主函数
-async def main(args):
-    """
-    主函数
-    
-    Args:
-        args: 命令行参数
-    """
-    # 注册信号处理
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-    
-    # 创建线程池
-    # 新版麦麦用 WebSocket 双向通信，Router 统一处理收发，
-    # 只需启动微信监听器一个进程即可。
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        tasks = []
-        
-        # 启动微信监听器（含 Router 双向通信）
-        wx_future = executor.submit(
-            run_wx_listener, 
-            args.target_chats.split(',') if args.target_chats else WX_TARGET_CHATS
+            import pythoncom as _pythoncom
+            pythoncom = _pythoncom
+            pythoncom.CoInitialize()
+        except ImportError as exc:
+            raise RuntimeError("Windows UI 线程需要 pywin32/pythoncom") from exc
+        from wxauto import uiautomation as _uia
+        uia = _uia
+        uia.InitializeUIAutomationInCurrentThread()
+        listener = WeChatListener(
+            target_chats=target_chats if inbound_enabled else [],
+            callback=message_callback if inbound_enabled else None,
+            command_queue=commands,
+            stop_event=stop_event,
         )
-        tasks.append(wx_future)
-        
-        # 等待停止事件
-        try:
-            while not stop_event.is_set():
-                await asyncio.sleep(1)
-                
-                # 检查任务状态
-                for i, future in enumerate(tasks):
-                    if future.done() and not stop_event.is_set():
-                        # 如果任务异常终止，记录错误
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logger.error(f"任务 {i} 异常终止: {str(e)}")
-        except asyncio.CancelledError:
-            logger.info("主任务被取消")
-        
-        # 设置停止事件（以防万一）
+        state["listener"] = listener
+        state["ready"].set()
+        listener.start_listening()
+    except BaseException as exc:
+        state["error"] = exc
+        state["ready"].set()
+        logger.exception("UI worker 异常")
+    finally:
+        if listener:
+            try:
+                listener.close()
+            except Exception:
+                logger.exception("清理微信监听资源失败")
+        if uia:
+            try:
+                uia.UninitializeUIAutomationInCurrentThread()
+            except Exception:
+                logger.exception("释放 UIAutomation 失败")
+        if pythoncom:
+            pythoncom.CoUninitialize()
         stop_event.set()
-        
-        logger.info("正在等待所有任务完成...")
-        
-        # 等待最多10秒让其他任务完成
-        timeout = time.time() + 10
-        while time.time() < timeout:
-            if all(future.done() for future in tasks):
+
+
+def _handle_signal(signum, _frame):
+    logger.info("收到信号 %s，开始停止", signum)
+    stop_event.set()
+
+
+async def main(args):
+    stop_event.clear()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    inbound = not args.maibot_to_wx
+    outbound = not args.wx_to_maibot
+    targets = _parse_list(args.target_chats, WX_TARGET_CHATS) if args.target_chats else WX_TARGET_CHATS
+    commands = UICommandQueue()
+    processor = create_message_processor(
+        ui_submit=commands.submit, inbound_enabled=inbound, outbound_enabled=outbound
+    )
+    for target in targets:
+        if isinstance(target, dict) and target.get("type") in {"private", "group"}:
+            processor.register_target(target["name"], target["type"])
+    set_global_processor(processor)
+    ui_thread = None
+    state = {"ready": threading.Event(), "error": None, "listener": None}
+    try:
+        processor.start(timeout=20)
+        logger.info("Router WebSocket 已连接")
+        ui_thread = threading.Thread(
+            target=run_ui_worker,
+            args=(targets, commands, inbound, state),
+            name="wechat-ui",
+            daemon=True,
+        )
+        ui_thread.start()
+        if not await asyncio.to_thread(state["ready"].wait, 30):
+            raise TimeoutError("微信 UI worker 启动超时")
+        if state["error"]:
+            raise RuntimeError("微信 UI worker 启动失败") from state["error"]
+        logger.info("服务已就绪 mode=%s chats=%s listen_all_if_empty=%s",
+                    "双向" if inbound and outbound else ("微信到MaiBot" if inbound else "MaiBot到微信"),
+                    targets, WX_LISTEN_ALL_IF_EMPTY)
+        while not stop_event.is_set():
+            if not ui_thread.is_alive():
+                stop_event.set()
+                if state["error"]:
+                    raise RuntimeError("UI worker 异常结束") from state["error"]
                 break
+            if processor._thread and not processor._thread.is_alive():
+                stop_event.set()
+                raise RuntimeError("Router worker 异常结束") from processor.startup_error
             await asyncio.sleep(0.5)
-        
-        # 如果还有任务未完成，记录警告
-        for i, future in enumerate(tasks):
-            if not future.done():
-                logger.warning(f"任务 {i} 未能正常结束")
-        
-        logger.info("所有服务已停止")
+    finally:
+        stop_event.set()
+        processor.stop(timeout=15)
+        if ui_thread:
+            ui_thread.join(timeout=10)
+            if ui_thread.is_alive():
+                logger.error("UI worker 在 10 秒内未退出；daemon 线程将随进程结束")
+        set_global_processor(None)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="WeMai - 微信消息转发服务")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--all", action="store_true", help="启动双向转发（默认）")
+    group.add_argument("--wx-to-maibot", action="store_true", help="仅微信到 MaiBot")
+    group.add_argument("--maibot-to-wx", action="store_true", help="仅 MaiBot 到微信")
+    parser.add_argument("--target-chats", help="聊天名称，逗号分隔；类型配置请使用环境配置")
+    return parser.parse_args(argv)
+
 
 if __name__ == "__main__":
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description="WeMai - 微信消息转发服务")
-    
-    # 服务选择参数（保留向后兼容，但实际都只启动微信监听器+Router）
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--all', action='store_true', help='启动所有服务（默认）')
-    group.add_argument('--wx-to-maibot', action='store_true', help='仅启动微信到MaiBot的消息转发')
-    group.add_argument('--maibot-to-wx', action='store_true', help='仅启动MaiBot到微信的消息转发')
-    
-    # 其他参数
-    parser.add_argument('--target-chats', type=str, help='要监听的微信聊天对象，多个用逗号分隔')
-    
-    # 解析参数
-    args = parser.parse_args()
-    
-    # 打印启动信息
-    logger.info("=" * 50)
-    logger.info("WeMai - 微信消息转发服务")
-    logger.info("=" * 50)
-    
-    logger.info("启动模式: 全部服务（WebSocket 双向通信，无需 Redis）")
-    
-    if args.target_chats:
-        logger.info(f"监听聊天: {args.target_chats}")
-    else:
-        logger.info("监听聊天: 所有聊天")
-    
-    logger.info("=" * 50)
-    
-    # 运行主函数
+    configure_logging()
     try:
-        asyncio.run(main(args))
+        asyncio.run(main(parse_args()))
     except KeyboardInterrupt:
-        logger.info("程序被用户中断")
-    except Exception as e:
-        logger.error(f"程序异常退出: {str(e)}")
+        pass
+    except Exception:
+        logger.exception("程序异常退出")
         sys.exit(1)

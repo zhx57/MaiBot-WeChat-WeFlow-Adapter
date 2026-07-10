@@ -5,8 +5,13 @@ WePush 配置模块
 
 import os
 import logging
+import json
 from typing import List, Optional
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs):
+        return False
 
 # 加载.env文件
 load_dotenv()
@@ -16,7 +21,26 @@ def _parse_list(value: Optional[str], default: List[str] = None) -> List[str]:
     """解析逗号分隔的字符串为列表"""
     if not value:
         return default or []
-    return [item.strip() for item in value.split(',') if item.strip()]
+    if value.lstrip().startswith('['):
+        parsed = json.loads(value)
+        if not isinstance(parsed, list):
+            raise ValueError('聊天列表 JSON 必须是数组')
+        result = []
+        seen = set()
+        for item in parsed:
+            if isinstance(item, str):
+                key = item.strip()
+                normalized = key
+            elif isinstance(item, dict):
+                key = str(item.get('name', '')).strip()
+                normalized = {'name': key, 'type': item.get('type')}
+            else:
+                raise ValueError('聊天列表项必须是字符串或对象')
+            if key and key not in seen:
+                seen.add(key)
+                result.append(normalized)
+        return result
+    return list(dict.fromkeys(item.strip() for item in value.split(',') if item.strip()))
 
 def _parse_bool(value: Optional[str], default: bool = False) -> bool:
     """解析字符串为布尔值"""
@@ -42,13 +66,25 @@ WX_EXCLUDED_CHATS = _parse_list(
 MAIBOT_API_URL = os.getenv('MAIBOT_API_URL', 'ws://127.0.0.1:8000/ws')
 
 # 日志配置
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').strip().upper()
 LOG_FILE = os.getenv('LOG_FILE', 'wepush.log')
 LOG_FORMAT = os.getenv('LOG_FORMAT', '%(asctime)s - %(levelname)s - %(message)s')
 LOG_DATE_FORMAT = os.getenv('LOG_DATE_FORMAT', '%Y-%m-%d %H:%M:%S')
 
 # 平台标识
 PLATFORM_ID = os.getenv('PLATFORM_ID', 'wxauto')
+WX_BOT_NICKNAME = os.getenv('WX_BOT_NICKNAME', '').strip()
+IMAGE_AUTO_DOWNLOAD = _parse_bool(os.getenv('IMAGE_AUTO_DOWNLOAD'), True)
+IMAGE_RECOGNITION_ENABLED = _parse_bool(os.getenv('IMAGE_RECOGNITION_ENABLED'), True)
+MAX_MEDIA_BYTES = int(os.getenv('MAX_MEDIA_BYTES', str(10 * 1024 * 1024)))
+SEND_QUEUE_SIZE = int(os.getenv('SEND_QUEUE_SIZE', '100'))
+UI_QUEUE_SIZE = int(os.getenv('UI_QUEUE_SIZE', '100'))
+ID_MAP_FILE = os.getenv('ID_MAP_FILE', 'wemai_id_map.json')
+LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+
+if LOG_LEVEL not in {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}:
+    raise ValueError(f"无效 LOG_LEVEL: {LOG_LEVEL!r}")
 
 # 配置信息打印
 def print_config_info():
@@ -63,7 +99,4 @@ def print_config_info():
     logger.info(f"\u5e73台标识: {PLATFORM_ID}")
     logger.info("==========================\n")
 
-# 如果直接运行该模块，打印配置信息
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    print_config_info()
+# 日志只由 main.configure_logging() 集中初始化。
