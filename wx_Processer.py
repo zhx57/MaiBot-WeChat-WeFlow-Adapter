@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -66,10 +67,14 @@ class MessageProcessor:
         self._loop = None
         self._router_task = None
         self._send_task = None
+        self._inbound_task = None
+        self._health_task = None
+        self._stop_requested = threading.Event()
         self._stopping = threading.Event()
         self._id_lock = threading.RLock()
         self._id_to_name = {}
-        self._dead_letters = []
+        self._db_path = str(Path(ID_MAP_FILE).with_suffix(".sqlite3"))
+        self._init_storage()
         self._load_id_map()
 
         route = RouteConfig(route_config={
@@ -95,6 +100,7 @@ class MessageProcessor:
         self.ready_event.clear()
         self.startup_error = None
         self._stopping.clear()
+        self._stop_requested.clear()
         self._thread = threading.Thread(target=self._router_thread, name="maibot-router", daemon=True)
         self._thread.start()
         if not self.ready_event.wait(timeout):
@@ -111,11 +117,14 @@ class MessageProcessor:
         asyncio.set_event_loop(loop)
         try:
             self._send_queue = asyncio.Queue(maxsize=SEND_QUEUE_SIZE)
+            self._handler_semaphore = asyncio.Semaphore(min(32, SEND_QUEUE_SIZE))
             self._send_task = loop.create_task(self._process_send_queue())
+            self._inbound_task = loop.create_task(self._process_inbound_queue())
+            self._health_task = loop.create_task(self._health_monitor())
             self._router_task = loop.create_task(self.router.run())
             loop.run_until_complete(self._wait_router_ready())
             self.ready_event.set()
-            loop.run_until_complete(self._router_task)
+            loop.run_until_complete(self._supervise_router())
         except BaseException as exc:
             if not self._stopping.is_set():
                 self.startup_error = exc
@@ -139,22 +148,32 @@ class MessageProcessor:
         await self._router_task
         raise RuntimeError("Router 在连接就绪前退出")
 
+    async def _supervise_router(self):
+        while not self._stop_requested.is_set():
+            if self._router_task.done():
+                await self._router_task
+                raise RuntimeError("Router 意外退出")
+            if self._health_task.done():
+                await self._health_task
+            await asyncio.sleep(0.2)
+        self.router._running = False
+        try:
+            await self.router.stop()
+        except (asyncio.CancelledError, Exception):
+            logger.debug("Router shutdown returned an exception", exc_info=True)
+
+    async def _health_monitor(self):
+        failures = 0
+        while not self._stop_requested.is_set():
+            await asyncio.sleep(5)
+            failures = 0 if self.router.check_connection(self.platform) else failures + 1
+            if failures >= 3:
+                raise ConnectionError("Router 连接连续健康检查失败")
+
     def stop(self, timeout=15):
         """Stop websocket, cancel workers, close loop, and join its thread."""
         self._stopping.set()
-        loop = self._loop
-        if loop and loop.is_running():
-            async def shutdown():
-                self.router._running = False
-                await self.router.stop()
-
-            future = asyncio.run_coroutine_threadsafe(shutdown(), loop)
-            try:
-                future.result(timeout=timeout)
-            except FutureCancelledError:
-                logger.warning("Router stop future 被底层取消，继续等待线程清理")
-            except (FutureTimeoutError, RuntimeError):
-                logger.error("Router 停止超时")
+        self._stop_requested.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout)
             if self._thread.is_alive():
@@ -182,7 +201,8 @@ class MessageProcessor:
             try:
                 if not self.ui_submit:
                     raise RuntimeError("UI 命令执行器尚未绑定")
-                ok = await asyncio.to_thread(self.ui_submit, "send", receiver, kind, data, 15)
+                ok = await asyncio.to_thread(
+                    self.ui_submit, "send", receiver, kind, data, timeout=15)
                 if ok is not True:
                     raise RuntimeError("wxauto 返回发送失败")
                 logger.info("消息已发送 target=%s type=%s", receiver, kind)
@@ -191,17 +211,19 @@ class MessageProcessor:
                 last_error = exc
                 logger.warning("发送失败 target=%s type=%s attempt=%d/3: %s",
                                receiver, kind, attempt, exc)
+                # 已开始执行但结果未知时绝不能重试，否则可能重复发送。
+                if getattr(exc, "retry_safe", True) is False:
+                    break
                 if attempt < 3:
                     await asyncio.sleep(attempt)
-        dead = {"receiver": receiver, "type": kind, "error": str(last_error), "time": time.time()}
-        self._dead_letters.append(dead)
         logger.error("消息进入死信 target=%s type=%s error=%s", receiver, kind, last_error)
         raise RuntimeError("微信消息发送重试耗尽") from last_error
 
     async def _handle_maibot_response(self, message):
         if not self.outbound_enabled:
             return
-        try:
+        async with self._handler_semaphore:
+          try:
             if isinstance(message, dict):
                 message = MessageBase.from_dict(message)
             info = message.message_info
@@ -212,7 +234,10 @@ class MessageProcessor:
             logger.info("收到 MaiBot 回复 id=%s segment_type=%s", message_id,
                         self._segment_value(message.message_segment, "type"))
             await self._process_segments(message.message_segment, receiver)
-        except Exception:
+          except Exception as exc:
+            payload = message.to_dict() if hasattr(message, "to_dict") else message
+            self._store_dead_letter(getattr(getattr(message, "message_info", None), "message_id", None),
+                                    {"direction": "outbound", "message": payload}, exc)
             logger.exception("处理 MaiBot 回复失败")
 
     @staticmethod
@@ -263,7 +288,6 @@ class MessageProcessor:
                 self._send_queue.put((receiver, kind, data, completion)), timeout=2
             )
         except asyncio.TimeoutError as exc:
-            self._dead_letters.append({"receiver": receiver, "type": kind, "error": "queue full"})
             raise RuntimeError("微信发送队列已满") from exc
         await completion
 
@@ -322,22 +346,61 @@ class MessageProcessor:
             raise ValueError("文件超过尺寸上限")
         return data
 
-    def process_message(self, chat_name, message_data):
+    def enqueue_message(self, chat_name, message_data):
+        """Persist an inbound message without waiting for websocket I/O."""
         if not self.inbound_enabled:
             return {"success": False, "error": "微信到 MaiBot 方向已禁用"}
-        if not self.ready_event.is_set() or self.startup_error or not self._loop:
-            return {"success": False, "error": "Router 未就绪"}
         try:
             message = self._build_message(chat_name, message_data)
-            future = asyncio.run_coroutine_threadsafe(self.router.send_message(message), self._loop)
-            future.result(timeout=10)
-            info = message.message_info
-            logger.info("已转发至 MaiBot id=%s type=%s",
-                        info.message_id, message.message_segment.type)
+            payload = json.dumps(message.to_dict(), ensure_ascii=False)
+            with self._connect() as db:
+                pending = db.execute("SELECT COUNT(*) FROM inbound WHERE state='pending'").fetchone()[0]
+                if pending >= SEND_QUEUE_SIZE:
+                    raise RuntimeError("持久化入站队列已满")
+                db.execute("INSERT OR IGNORE INTO inbound(message_id,payload,state,attempts,next_try,created) "
+                           "VALUES(?,?,'pending',0,0,?)",
+                           (message.message_info.message_id, payload, time.time()))
             return {"success": True}
         except Exception as exc:
             logger.error("转发至 MaiBot 失败: %s", exc)
             return {"success": False, "error": str(exc)}
+
+    # Compatibility: unlike the old implementation this call is non-blocking.
+    process_message = enqueue_message
+
+    async def _process_inbound_queue(self):
+        while not self._stop_requested.is_set():
+            now = time.time()
+            with self._connect() as db:
+                row = db.execute("SELECT message_id,payload,attempts FROM inbound "
+                                 "WHERE state='pending' AND next_try<=? ORDER BY created LIMIT 1",
+                                 (now,)).fetchone()
+            if not row:
+                await asyncio.sleep(0.25)
+                continue
+            message_id, payload, attempts = row
+            try:
+                if not self.router.check_connection(self.platform):
+                    raise ConnectionError("Router 未连接")
+                await self.router.send_message(MessageBase.from_dict(json.loads(payload)))
+                with self._connect() as db:
+                    db.execute("UPDATE inbound SET state='sent' WHERE message_id=?", (message_id,))
+                    db.execute("DELETE FROM inbound WHERE state='sent' AND created<?",
+                               (time.time() - 86400 * 7,))
+                logger.info("已转发至 MaiBot id=%s", message_id)
+            except Exception as exc:
+                attempts += 1
+                if attempts >= 10:
+                    self._store_dead_letter(message_id,
+                                            {"direction": "inbound", "message": json.loads(payload)}, exc)
+                    with self._connect() as db:
+                        db.execute("UPDATE inbound SET state='dead',attempts=? WHERE message_id=?",
+                                   (attempts, message_id))
+                else:
+                    with self._connect() as db:
+                        db.execute("UPDATE inbound SET attempts=?,next_try=? WHERE message_id=?",
+                                   (attempts, time.time() + min(300, 2 ** attempts), message_id))
+                await asyncio.sleep(0.25)
 
     def _build_message(self, chat_name, data):
         chat_name = self._text(chat_name)
@@ -368,7 +431,8 @@ class MessageProcessor:
         sender = SenderInfo(group_info=group, user_info=user)
         receiver = ReceiverInfo(group_info=group, user_info=None if group else bot)
         segment = self._inbound_segment(content)
-        format_info = FormatInfo(content_format=["text"], accept_format=["text", "emoji"])
+        format_info = FormatInfo(content_format=[segment.type],
+                                 accept_format=["text", "emoji", "image", "file"])
         info = BaseMessageInfo(
             platform=self.platform, message_id=message_id, time=time.time(),
             group_info=group, user_info=user, format_info=format_info, template_info=None,
@@ -393,7 +457,11 @@ class MessageProcessor:
     def _remember(self, identifier, name, chat_type):
         with self._id_lock:
             self._id_to_name[identifier] = {"name": name, "type": chat_type, "updated": time.time()}
-            self._save_id_map()
+            with self._connect() as db:
+                db.execute("INSERT OR REPLACE INTO id_map(identifier,name,type,updated) VALUES(?,?,?,?)",
+                           (identifier, name, chat_type, time.time()))
+                db.execute("DELETE FROM id_map WHERE identifier IN (SELECT identifier FROM id_map "
+                           "ORDER BY updated DESC LIMIT -1 OFFSET 100000)")
 
     def _resolve_receiver(self, info):
         if info is None:
@@ -404,17 +472,19 @@ class MessageProcessor:
             candidates.extend((getattr(receiver, "group_info", None),
                                getattr(receiver, "user_info", None)))
         candidates.extend((getattr(info, "group_info", None), getattr(info, "user_info", None)))
+        bot_id = self._stable_id("bot", WX_BOT_NICKNAME or "self")
+        bot_names = {"WeMai", WX_BOT_NICKNAME} - {""}
+        # Only stable IDs are authoritative. Nicknames are deliberately not routing keys.
         for value in candidates:
             if not value:
                 continue
             identifier = getattr(value, "group_id", None) or getattr(value, "user_id", None)
-            name = getattr(value, "group_name", None) or getattr(value, "user_nickname", None)
-            if identifier:
+            if identifier and identifier != bot_id:
                 mapped = self._id_to_name.get(identifier)
                 if mapped:
-                    return mapped["name"] if isinstance(mapped, dict) else mapped
-            if name and name != WX_BOT_NICKNAME:
-                return name
+                    name = mapped["name"] if isinstance(mapped, dict) else mapped
+                    if name not in bot_names:
+                        return name
         config = getattr(info, "additional_config", None)
         target = None
         if config:
@@ -422,27 +492,85 @@ class MessageProcessor:
                 target = config.get("platform_io_target_user_id")
             else:
                 target = getattr(config, "platform_io_target_user_id", None)
-        mapped = self._id_to_name.get(target)
-        return (mapped.get("name") if isinstance(mapped, dict) else mapped) if mapped else None
+        mapped = self._id_to_name.get(target) if target and target != bot_id else None
+        name = (mapped.get("name") if isinstance(mapped, dict) else mapped) if mapped else None
+        return name if name and name not in bot_names else None
 
     def _load_id_map(self):
+        # One-time migration from the legacy {id: name|record} JSON file.
         try:
             with open(ID_MAP_FILE, "r", encoding="utf-8") as stream:
                 value = json.load(stream)
             if isinstance(value, dict):
-                self._id_to_name = value
+                with self._connect() as db:
+                    for identifier, record in value.items():
+                        if isinstance(record, dict):
+                            name, kind = record.get("name"), record.get("type")
+                        else:
+                            name, kind = record, None
+                        if name:
+                            db.execute("INSERT OR IGNORE INTO id_map(identifier,name,type,updated) "
+                                       "VALUES(?,?,?,?)", (identifier, name, kind, time.time()))
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
-            logger.warning("ID 映射读取失败，将使用空映射", exc_info=True)
+            logger.warning("旧 ID 映射读取失败；SQLite 数据不受影响", exc_info=True)
+        with self._connect() as db:
+            self._id_to_name = {
+                row[0]: {"name": row[1], "type": row[2], "updated": row[3]}
+                for row in db.execute("SELECT identifier,name,type,updated FROM id_map")
+            }
 
-    def _save_id_map(self):
-        path = Path(ID_MAP_FILE)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        try:
-            temporary.parent.mkdir(parents=True, exist_ok=True)
-            with temporary.open("w", encoding="utf-8") as stream:
-                json.dump(self._id_to_name, stream, ensure_ascii=False, indent=2)
-            os.replace(temporary, path)
-        except OSError:
-            logger.error("ID 映射持久化失败 path=%s", path, exc_info=True)
+    def _connect(self):
+        return sqlite3.connect(self._db_path, timeout=10)
+
+    def _init_storage(self):
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA busy_timeout=10000")
+            db.execute("CREATE TABLE IF NOT EXISTS id_map (identifier TEXT PRIMARY KEY, "
+                       "name TEXT NOT NULL, type TEXT, updated REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS inbound (message_id TEXT PRIMARY KEY, "
+                       "payload TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, "
+                       "next_try REAL NOT NULL, created REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS dead_letters (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                       "message_id TEXT, payload TEXT NOT NULL, error TEXT, created REAL NOT NULL, "
+                       "replayed INTEGER NOT NULL DEFAULT 0)")
+
+    def _store_dead_letter(self, message_id, payload, error):
+        with self._connect() as db:
+            count = db.execute("SELECT COUNT(*) FROM dead_letters WHERE replayed=0").fetchone()[0]
+            if count >= SEND_QUEUE_SIZE * 10:
+                logger.critical("死信存储已满 count=%d；删除最旧记录", count)
+                db.execute("DELETE FROM dead_letters WHERE id=(SELECT id FROM dead_letters "
+                           "WHERE replayed=0 ORDER BY id LIMIT 1)")
+            db.execute("INSERT INTO dead_letters(message_id,payload,error,created) VALUES(?,?,?,?)",
+                       (message_id, json.dumps(payload, ensure_ascii=False, default=str),
+                        str(error), time.time()))
+
+    def replay_dead_letters(self, limit=100):
+        """Replay persisted inbound dead letters; returns number scheduled."""
+        replayed = 0
+        with self._connect() as db:
+            rows = db.execute("SELECT id,message_id,payload FROM dead_letters "
+                              "WHERE replayed=0 ORDER BY id LIMIT ?", (limit,)).fetchall()
+            for dead_id, message_id, payload in rows:
+                data = json.loads(payload)
+                if data.get("direction") == "inbound":
+                    db.execute("INSERT OR REPLACE INTO inbound(message_id,payload,state,attempts,next_try,created) "
+                               "VALUES(?,?,'pending',0,0,?)",
+                               (message_id, json.dumps(data["message"], ensure_ascii=False), time.time()))
+                elif data.get("direction") == "outbound" and self._loop:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._handle_maibot_response(MessageBase.from_dict(data["message"])),
+                            self._loop)
+                    except RuntimeError:
+                        logger.warning("Router loop 已关闭，无法重放 outbound 死信 id=%s", dead_id)
+                        continue
+                else:
+                    continue
+                db.execute("UPDATE dead_letters SET replayed=1 WHERE id=?", (dead_id,))
+                replayed += 1
+        return replayed

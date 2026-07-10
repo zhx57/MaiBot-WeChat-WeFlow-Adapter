@@ -76,12 +76,23 @@ PLATFORM_ID = os.getenv('PLATFORM_ID', 'wxauto')
 WX_BOT_NICKNAME = os.getenv('WX_BOT_NICKNAME', '').strip()
 IMAGE_AUTO_DOWNLOAD = _parse_bool(os.getenv('IMAGE_AUTO_DOWNLOAD'), True)
 IMAGE_RECOGNITION_ENABLED = _parse_bool(os.getenv('IMAGE_RECOGNITION_ENABLED'), True)
-MAX_MEDIA_BYTES = int(os.getenv('MAX_MEDIA_BYTES', str(10 * 1024 * 1024)))
-SEND_QUEUE_SIZE = int(os.getenv('SEND_QUEUE_SIZE', '100'))
-UI_QUEUE_SIZE = int(os.getenv('UI_QUEUE_SIZE', '100'))
+def _bounded_int(name: str, default: int, maximum: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必须是整数，当前值: {raw!r}") from exc
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{name} 必须在 1..{maximum} 范围内，当前值: {value}")
+    return value
+
+
+MAX_MEDIA_BYTES = _bounded_int('MAX_MEDIA_BYTES', 10 * 1024 * 1024, 1024 * 1024 * 1024)
+SEND_QUEUE_SIZE = _bounded_int('SEND_QUEUE_SIZE', 100, 100000)
+UI_QUEUE_SIZE = _bounded_int('UI_QUEUE_SIZE', 100, 10000)
 ID_MAP_FILE = os.getenv('ID_MAP_FILE', 'wemai_id_map.json')
-LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024)))
-LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+LOG_MAX_BYTES = _bounded_int('LOG_MAX_BYTES', 10 * 1024 * 1024, 10 * 1024 * 1024 * 1024)
+LOG_BACKUP_COUNT = _bounded_int('LOG_BACKUP_COUNT', 5, 100)
 
 if LOG_LEVEL not in {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}:
     raise ValueError(f"无效 LOG_LEVEL: {LOG_LEVEL!r}")

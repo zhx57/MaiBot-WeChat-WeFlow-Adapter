@@ -13,6 +13,7 @@ from .color import *
 import time
 import os
 import re
+import logging
 try:
     from typing import Literal
 except:
@@ -21,6 +22,7 @@ except:
 class WeChat(WeChatBase):
     VERSION: str = '3.9.11.17'
     lastmsgid: str = None
+    _version_warning_emitted: bool = False
 
     def __init__(
             self, 
@@ -37,7 +39,13 @@ class WeChat(WeChatBase):
         self.SessionItemList = []
         set_debug(debug)
         self.language = language
-        self._checkversion()
+        try:
+            self._checkversion()
+        except Exception:
+            if not type(self)._version_warning_emitted:
+                logging.getLogger(__name__).warning(
+                    '无法探测微信版本；跳过版本门禁并继续启动', exc_info=True)
+                type(self)._version_warning_emitted = True
         self._show()
         MainControl1 = [i for i in self.UiaAPI.GetChildren() if not i.ClassName][0]
         MainControl2 = MainControl1.GetFirstChildControl()
@@ -78,9 +86,12 @@ class WeChat(WeChatBase):
         wxpath = GetPathByHwnd(self.HWND)
         wxversion = GetVersionByPath(wxpath)
         if wxversion != self.VERSION:
-            raise RuntimeError(
-                f'不支持的微信版本 {wxversion!r}，当前 wxauto 仅支持 {self.VERSION}'
-            )
+            if not type(self)._version_warning_emitted:
+                logging.getLogger(__name__).warning(
+                    '微信版本 %r 与 wxauto 已验证版本 %s 不一致；继续运行，请关注 UI 兼容性',
+                    wxversion, self.VERSION)
+                type(self)._version_warning_emitted = True
+            return False
         return True
     
     
@@ -320,6 +331,14 @@ class WeChat(WeChatBase):
         else:
             self.UiaAPI.SendKeys('{Ctrl}f', waitTime=1)
             self.B_Search.SendKeys(who, waitTime=1.5)
+            # 搜索结果可能包含多个同名联系人/群；没有稳定微信 ID 时必须拒绝猜测。
+            exact = [item for item in self.SessionBox.GetChildren()
+                     for node in ([item] + list(item.GetChildren()))
+                     if getattr(node, 'Name', None) in {who, f'<em>{who}</em>'}]
+            if len(exact) > 1:
+                wxlog.error(f'搜索到多个同名目标，拒绝选择: {who}')
+                self._refresh()
+                return False
             target_control = self.SessionBox.TextControl(Name=f"<em>{who}</em>")
             if target_control.Exists(timeout):
                 wxlog.debug('选择完全匹配项')

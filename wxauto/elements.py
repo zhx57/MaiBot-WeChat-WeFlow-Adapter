@@ -41,7 +41,10 @@ class WeChatBase:
             Index = 1
             User = MsgItem.ButtonControl(foundIndex=Index)
             try:
+                deadline = time.monotonic() + 2.0
                 while True:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('查找消息发送者控件超时')
                     if User.Name == '':
                         Index += 1
                         User = MsgItem.ButtonControl(foundIndex=Index)

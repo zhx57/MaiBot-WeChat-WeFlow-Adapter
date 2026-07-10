@@ -5,7 +5,10 @@ import queue
 import re
 import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
 
 from config import (
@@ -19,17 +22,66 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class UICommand:
+    action: str
+    args: tuple
+    timeout: float
+    command_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    created: float = field(default_factory=time.monotonic)
+    future: Future = field(default_factory=Future)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    started: bool = False
+    cancelled: bool = False
+
+    @property
+    def deadline(self):
+        return self.created + self.timeout
+
+    def cancel_if_pending(self):
+        with self._lock:
+            if self.started:
+                return False
+            self.cancelled = True
+            self.future.cancel()
+            return True
+
+    def begin(self):
+        with self._lock:
+            if self.cancelled or time.monotonic() >= self.deadline:
+                self.cancelled = True
+                self.future.cancel()
+                return False
+            self.started = True
+            return True
+
+
+class UICommandTimeout(TimeoutError):
+    def __init__(self, command_id, retry_safe):
+        super().__init__(f"UI 命令超时 id={command_id} retry_safe={retry_safe}")
+        self.command_id = command_id
+        self.retry_safe = retry_safe
+
+
 class UICommandQueue:
     def __init__(self, maxsize=UI_QUEUE_SIZE):
         self._queue = queue.Queue(maxsize=maxsize)
 
     def submit(self, action, *args, timeout=15):
-        future = Future()
+        command = UICommand(action=action, args=args, timeout=float(timeout))
         try:
-            self._queue.put((action, args, future), timeout=2)
+            self._queue.put(command, timeout=2)
         except queue.Full as exc:
             raise RuntimeError("UI 命令队列已满") from exc
-        return future.result(timeout=timeout)
+        try:
+            return command.future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            retry_safe = command.cancel_if_pending()
+            if not retry_safe:
+                # Execution already started. Its outcome must be observed before the
+                # caller may release media or decide whether a retry is safe.
+                return command.future.result()
+            raise UICommandTimeout(command.command_id, retry_safe) from exc
 
     def get_nowait(self):
         return self._queue.get_nowait()
@@ -41,7 +93,8 @@ class UICommandQueue:
 class WeChatListener:
     """Owns every wxauto object and uses it only from its creating thread."""
 
-    def __init__(self, target_chats=None, callback=None, command_queue=None, stop_event=None):
+    def __init__(self, target_chats=None, callback=None, command_queue=None, stop_event=None,
+                 heartbeat=None):
         from wxauto import WeChat
 
         self._owner_thread = threading.get_ident()
@@ -51,6 +104,7 @@ class WeChatListener:
         self.callback = callback
         self.commands = command_queue or UICommandQueue()
         self.stop_event = stop_event
+        self.heartbeat = heartbeat
         self.listen_chats = {}
         self.chat_types = {item["name"]: item.get("type") for item in self.target_specs
                            if item.get("type") in {"private", "group"}}
@@ -99,6 +153,8 @@ class WeChatListener:
         lost_since = None
         last_alive_check = 0
         while self.running and not (self.stop_event and self.stop_event.is_set()):
+            if self.heartbeat:
+                self.heartbeat()
             self._drain_commands(limit=20)
             now = time.monotonic()
             if now - last_alive_check >= 5:
@@ -129,23 +185,26 @@ class WeChatListener:
         self._assert_ui_thread()
         for _ in range(limit):
             try:
-                action, args, future = self.commands.get_nowait()
+                command = self.commands.get_nowait()
             except queue.Empty:
                 return
             try:
-                if action == "send":
-                    future.set_result(self._send(*args))
-                elif action == "stop":
+                if not command.begin():
+                    continue
+                if command.action == "send":
+                    command.future.set_result(self._send(*command.args))
+                elif command.action == "stop":
                     self.running = False
-                    future.set_result(True)
+                    command.future.set_result(True)
                 else:
-                    raise ValueError(f"未知 UI 命令: {action}")
+                    raise ValueError(f"未知 UI 命令: {command.action}")
             except BaseException as exc:
-                future.set_exception(exc)
+                if not command.future.done():
+                    command.future.set_exception(exc)
             finally:
                 self.commands.task_done()
 
-    def _send(self, receiver, kind, data, _caller_timeout=None):
+    def _send(self, receiver, kind, data):
         self._assert_ui_thread()
         if kind not in {"text", "image", "file"}:
             raise ValueError(f"不支持发送类型: {kind}")
@@ -208,7 +267,10 @@ class WeChatListener:
                     raise RuntimeError("AddListenChat 未创建有效窗口")
                 if getattr(chat, "who", None) != name:
                     raise RuntimeError("监听窗口标题与目标不匹配")
-                self.chat_types[name] = self.chat_types.get(name) or self._detect_chat_type(chat)
+                detected = self.chat_types.get(name) or self._detect_chat_type(chat)
+                if detected not in {"private", "group"}:
+                    raise RuntimeError("聊天类型不确定；请显式配置 {name,type}，拒绝监听")
+                self.chat_types[name] = detected
                 self.listen_chats[name] = True
                 self._failed_chats.discard(name)
                 logger.info("监听已建立 chat=%s type=%s", name, self.chat_types[name])
@@ -234,8 +296,8 @@ class WeChatListener:
                 return "group"
         except Exception as exc:
             logger.debug("聊天类型探测失败 chat=%s: %s", chat.who, exc)
-        # The group-only controls were probed successfully and none exists.
-        return "private"
+        logger.warning("无法可靠探测聊天类型 chat=%s；不会默认按私聊处理", chat.who)
+        return None
 
     def _check_new_messages(self):
         try:
@@ -354,7 +416,7 @@ def message_callback(chat_name, message_data):
     if not global_processor:
         logger.error("消息处理器未初始化")
         return
-    result = global_processor.process_message(chat_name, message_data)
+    result = global_processor.enqueue_message(chat_name, message_data)
     if not result.get("success"):
         logger.error("微信消息转发失败 chat=%s error=%s", chat_name, result.get("error"))
 

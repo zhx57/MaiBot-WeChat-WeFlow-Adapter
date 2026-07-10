@@ -64,6 +64,7 @@ def run_ui_worker(target_chats, commands, inbound_enabled, state):
             callback=message_callback if inbound_enabled else None,
             command_queue=commands,
             stop_event=stop_event,
+            heartbeat=lambda: state.__setitem__("heartbeat", time.monotonic()),
         )
         state["listener"] = listener
         state["ready"].set()
@@ -109,7 +110,8 @@ async def main(args):
             processor.register_target(target["name"], target["type"])
     set_global_processor(processor)
     ui_thread = None
-    state = {"ready": threading.Event(), "error": None, "listener": None}
+    state = {"ready": threading.Event(), "error": None, "listener": None,
+             "heartbeat": time.monotonic()}
     try:
         processor.start(timeout=20)
         logger.info("Router WebSocket 已连接")
@@ -136,6 +138,11 @@ async def main(args):
             if processor._thread and not processor._thread.is_alive():
                 stop_event.set()
                 raise RuntimeError("Router worker 异常结束") from processor.startup_error
+            if time.monotonic() - state["heartbeat"] > 30:
+                stop_event.set()
+                raise RuntimeError("UI worker heartbeat 超过 30 秒未更新")
+            if not processor.router.check_connection(processor.platform):
+                logger.warning("Router 当前未连接，后台健康检查将负责失败退出")
             await asyncio.sleep(0.5)
     finally:
         stop_event.set()
