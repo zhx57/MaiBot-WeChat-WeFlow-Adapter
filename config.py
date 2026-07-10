@@ -68,6 +68,7 @@ MAIBOT_API_URL = os.getenv('MAIBOT_API_URL', 'ws://127.0.0.1:8000/ws')
 # 日志配置
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').strip().upper()
 LOG_FILE = os.getenv('LOG_FILE', 'wepush.log')
+EXIT_LOG_FILE = os.getenv('EXIT_LOG_FILE', 'wemai_exit.log')
 LOG_FORMAT = os.getenv('LOG_FORMAT', '%(asctime)s - %(levelname)s - %(message)s')
 LOG_DATE_FORMAT = os.getenv('LOG_DATE_FORMAT', '%Y-%m-%d %H:%M:%S')
 
@@ -93,6 +94,8 @@ UI_QUEUE_SIZE = _bounded_int('UI_QUEUE_SIZE', 100, 10000)
 ID_MAP_FILE = os.getenv('ID_MAP_FILE', 'wemai_id_map.json')
 LOG_MAX_BYTES = _bounded_int('LOG_MAX_BYTES', 10 * 1024 * 1024, 10 * 1024 * 1024 * 1024)
 LOG_BACKUP_COUNT = _bounded_int('LOG_BACKUP_COUNT', 5, 100)
+EXIT_LOG_MAX_BYTES = _bounded_int('EXIT_LOG_MAX_BYTES', 1024 * 1024, 1024 * 1024 * 1024)
+EXIT_LOG_BACKUP_COUNT = _bounded_int('EXIT_LOG_BACKUP_COUNT', 3, 100)
 
 if LOG_LEVEL not in {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}:
     raise ValueError(f"无效 LOG_LEVEL: {LOG_LEVEL!r}")

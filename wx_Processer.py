@@ -71,6 +71,9 @@ class MessageProcessor:
         self._health_task = None
         self._stop_requested = threading.Event()
         self._stopping = threading.Event()
+        self._router_disconnect_since = None
+        self._router_restart_count = 0
+        self._router_last_error = None
         self._id_lock = threading.RLock()
         self._id_to_name = {}
         self._db_path = str(Path(ID_MAP_FILE).with_suffix(".sqlite3"))
@@ -150,11 +153,59 @@ class MessageProcessor:
 
     async def _supervise_router(self):
         while not self._stop_requested.is_set():
+            for name, task in (("发送队列", self._send_task),
+                               ("入站队列", self._inbound_task),
+                               ("健康监控", self._health_task)):
+                if task.done():
+                    await task
+                    raise RuntimeError(f"Router {name}任务意外结束")
+
+            try:
+                connected = self.router.check_connection(self.platform)
+            except Exception as exc:
+                connected = False
+                self._router_last_error = exc
+                logger.warning("Router 连接状态检查失败，按断连处理: %s", exc)
+            now = time.monotonic()
+            if connected:
+                if self._router_disconnect_since is not None:
+                    logger.info("Router 连接已恢复 outage=%.1fs restarts=%d",
+                                now - self._router_disconnect_since,
+                                self._router_restart_count)
+                self._router_disconnect_since = None
+                self._router_restart_count = 0
+                self._router_last_error = None
+            elif self._router_disconnect_since is None:
+                self._router_disconnect_since = now
+
+            if (self._router_disconnect_since is not None
+                    and now - self._router_disconnect_since > 600):
+                raise ConnectionError("Router 连接持续 600 秒无法恢复") from self._router_last_error
+
             if self._router_task.done():
-                await self._router_task
-                raise RuntimeError("Router 意外退出")
-            if self._health_task.done():
-                await self._health_task
+                try:
+                    await self._router_task
+                    error = RuntimeError("router.run() 意外正常返回")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    error = exc
+                self._router_last_error = error
+                self._router_disconnect_since = self._router_disconnect_since or now
+                self._router_restart_count += 1
+                delay = min(30, 2 ** min(self._router_restart_count, 5))
+                logger.warning("Router 任务退出，将在 %d 秒后重启 attempt=%d: %s",
+                               delay, self._router_restart_count, error,
+                               exc_info=(type(error), error, error.__traceback__))
+                deadline = time.monotonic() + delay
+                while not self._stop_requested.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.2, remaining))
+                if not self._stop_requested.is_set():
+                    self._router_task = asyncio.create_task(self.router.run())
+                continue
             await asyncio.sleep(0.2)
         self.router._running = False
         try:
@@ -166,9 +217,14 @@ class MessageProcessor:
         failures = 0
         while not self._stop_requested.is_set():
             await asyncio.sleep(5)
-            failures = 0 if self.router.check_connection(self.platform) else failures + 1
-            if failures >= 3:
-                raise ConnectionError("Router 连接连续健康检查失败")
+            try:
+                connected = self.router.check_connection(self.platform)
+            except Exception:
+                connected = False
+                logger.debug("Router 健康检查调用失败", exc_info=True)
+            failures = 0 if connected else failures + 1
+            if failures >= 3 and (failures == 3 or failures % 12 == 0):
+                logger.warning("Router 连接健康检查连续失败 count=%d；等待后台重连", failures)
 
     def stop(self, timeout=15):
         """Stop websocket, cancel workers, close loop, and join its thread."""

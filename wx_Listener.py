@@ -120,6 +120,9 @@ class WeChatListener:
         self._failed_chats = {}
         self._last_retry_time = 0
         self._chatwnd_cache = {}
+        self._command_active = False
+        self._command_started = None
+        self._reconnecting = False
         self.running = False
         logger.info("微信监听器初始化成功 account=%s", self.wx.nickname)
 
@@ -162,26 +165,57 @@ class WeChatListener:
 
         lost_since = None
         last_alive_check = 0
+        alive_check_failures = 0
+        reconnect_attempts = 0
+        next_reconnect = 0
+        wait_for_command = getattr(self.commands, "wait", None)
         while self.running and not (self.stop_event and self.stop_event.is_set()):
-            if self.heartbeat:
-                self.heartbeat()
+            self._touch_heartbeat()
             self._drain_commands(limit=20)
             now = time.monotonic()
             if now - last_alive_check >= 5:
                 last_alive_check = now
                 if not self._is_wechat_alive():
-                    lost_since = lost_since or now
-                    if now - lost_since > 600:
+                    alive_check_failures += 1
+                    logger.warning("微信窗口探测失败 count=%d/3", alive_check_failures)
+                    if alive_check_failures >= 3 and lost_since is None:
+                        lost_since = now
+                        logger.error("连续探测不到微信窗口，进入恢复模式")
+                    if lost_since is not None and now - lost_since > 600:
                         raise RuntimeError("微信窗口丢失超过 600 秒")
                     time.sleep(0.2)
                     continue
+                alive_check_failures = 0
                 if lost_since is not None:
-                    if not self._reconnect_wechat():
-                        raise RuntimeError("微信窗口重连失败")
-                    lost_since = None
+                    if now - lost_since > 600:
+                        raise RuntimeError("微信窗口丢失超过 600 秒")
+                    if now < next_reconnect:
+                        continue
+                    self._touch_heartbeat()
+                    self._reconnecting = True
+                    try:
+                        reconnected = self._reconnect_wechat()
+                    finally:
+                        self._reconnecting = False
+                        self._touch_heartbeat()
+                    if reconnected:
+                        logger.info("微信窗口重连成功 attempts=%d", reconnect_attempts + 1)
+                        lost_since = None
+                        reconnect_attempts = 0
+                        next_reconnect = 0
+                    else:
+                        reconnect_attempts += 1
+                        delay = min(30, 2 ** min(reconnect_attempts, 5))
+                        next_reconnect = now + delay
+                        logger.warning("微信窗口重连失败，将在 %d 秒后重试 attempt=%d",
+                                       delay, reconnect_attempts)
+                        continue
             self._check_new_messages()
             self._retry_failed_chats()
-            self.commands.wait(0.2)
+            if wait_for_command:
+                wait_for_command(0.2)
+            else:
+                time.sleep(0.2)
 
     def stop_listening(self):
         self.running = False
@@ -190,6 +224,10 @@ class WeChatListener:
         self._assert_ui_thread()
         self.running = False
         self._cleanup_wechat()
+
+    def _touch_heartbeat(self):
+        if self.heartbeat:
+            self.heartbeat()
 
     def _drain_commands(self, limit):
         self._assert_ui_thread()
@@ -201,6 +239,9 @@ class WeChatListener:
             try:
                 if not command.begin():
                     continue
+                self._command_active = True
+                self._command_started = time.monotonic()
+                self._touch_heartbeat()
                 if command.action == "send":
                     command.future.set_result(self._send(*command.args))
                 elif command.action == "stop":
@@ -212,6 +253,9 @@ class WeChatListener:
                 if not command.future.done():
                     command.future.set_exception(exc)
             finally:
+                self._touch_heartbeat()
+                self._command_active = False
+                self._command_started = None
                 self.commands.task_done()
 
     def _send(self, receiver, kind, data):
@@ -298,6 +342,7 @@ class WeChatListener:
         key = normalize_chat_name(name)
         for attempt in range(1, max_retries + 1):
             try:
+                self._touch_heartbeat()
                 self._clear_search_box()
                 self.wx.AddListenChat(name, savepic=IMAGE_AUTO_DOWNLOAD,
                                       savefile=False, savevoice=False)
@@ -416,14 +461,22 @@ class WeChatListener:
                 chat.Close()
             except Exception:
                 logger.debug("关闭旧监听窗口失败 chat=%s", name, exc_info=True)
-        self.wx.RemoveListenChat(name)
-        self.listen_chats.pop(key, None)
-        self._chatwnd_cache.pop(key, None)
+        try:
+            self.wx.RemoveListenChat(name)
+        except Exception:
+            logger.warning("移除监听窗口失败 chat=%s；本地状态仍将清理", name,
+                           exc_info=True)
+        finally:
+            self.listen_chats.pop(key, None)
+            self._chatwnd_cache.pop(key, None)
 
     def _cleanup_listeners(self):
-        for name in list(self.wx.listen):
+        for name in list(getattr(self.wx, "listen", {})):
             self._remove_listen(name)
-        self.wx.listen.clear()
+        try:
+            self.wx.listen.clear()
+        except Exception:
+            logger.warning("清空 wxauto 监听状态失败", exc_info=True)
         self.listen_chats.clear()
         self._chatwnd_cache.clear()
 
