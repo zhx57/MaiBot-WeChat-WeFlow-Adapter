@@ -22,7 +22,12 @@ from .constants import (
 )
 
 
-def should_ignore(data: dict[str, Any], bot_nicknames: list[str], bot_wxid: str) -> bool:
+def should_ignore(
+    data: dict[str, Any],
+    bot_nicknames: list[str],
+    bot_wxid: str,
+    ignore_self_message: bool = True,
+) -> bool:
     """自回复/语音/表情/空内容过滤。返回 True 表示丢弃。
 
     规则（任一命中即丢弃）：
@@ -39,15 +44,16 @@ def should_ignore(data: dict[str, Any], bot_nicknames: list[str], bot_wxid: str)
     content = data.get("content", "") or ""
     msg_type = data.get("type", 0) or data.get("msgType", 0) or 0
 
-    # 机器人自身发送的回流消息（self-reply 防护核心）
-    source_name = data.get("sourceName", "") or ""
-    if source_name and source_name in bot_nicknames:
-        return True
+    if ignore_self_message:
+        # 机器人自身发送的回流消息（self-reply 防护核心）
+        source_name = data.get("sourceName", "") or ""
+        if source_name and source_name in bot_nicknames:
+            return True
 
-    # 会话对方即机器人自身：优先 talkerId，SSE 事件无此字段时用 sessionId 兜底
-    talker_id = data.get("talkerId", "") or data.get("sessionId", "") or ""
-    if bot_wxid and talker_id and talker_id == bot_wxid:
-        return True
+        # 会话对方即机器人自身：优先 talkerId，SSE 事件无此字段时用 sessionId 兜底
+        talker_id = data.get("talkerId", "") or data.get("sessionId", "") or ""
+        if bot_wxid and talker_id and talker_id == bot_wxid:
+            return True
 
     # 语音消息（SSE 事件无 type 字段时此分支不命中，靠下方 content 兜底）
     if msg_type == WECHAT_VOICE_TYPE:
@@ -75,10 +81,14 @@ class ContentDeduper:
                  maxsize: int = DEFAULT_CONTENT_DEDUPE_MAXSIZE) -> None:
         self._cache: TTLCache[str, bool] = TTLCache(maxsize=maxsize, ttl=ttl)
 
-    def is_duplicate(self, contact: str, content: str) -> bool:
-        """键为 ``f"{contact}:{content}"``。存在返回 True，否则存入并返回 False。"""
+    def is_duplicate(self, contact: str, content: str, unique_hint: str = "") -> bool:
+        """存在返回 True，否则存入并返回 False。
 
-        key = f"{contact}:{content}"
+        ``unique_hint`` 用于图片、文件等占位内容，避免同一会话连续多张 ``[图片]``
+        被误判为重复。
+        """
+
+        key = f"{contact}:{content}:{unique_hint}" if unique_hint else f"{contact}:{content}"
         if key in self._cache:
             return True
         self._cache[key] = True

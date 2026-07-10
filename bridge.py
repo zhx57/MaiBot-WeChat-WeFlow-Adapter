@@ -183,13 +183,20 @@ class WeChatBridge:
             return
 
         # 3. 自回复/语音/表情/空内容过滤
-        if should_ignore(data, self._config.bot.nicknames, self._config.bot.wxid):
+        if should_ignore(
+            data,
+            self._config.bot.nicknames,
+            self._config.bot.wxid,
+            self._config.filters.ignore_self_message,
+        ):
             return
 
-        # 4. 内容去重
+        # 4. 内容去重。同一会话连续图片的 content 都是 [图片]，必须把 rawid
+        # 纳入键，否则第二张图片会被误丢。
         contact_key = self._compute_contact_key(data)
         content = data.get("content", "") or ""
-        if self._state.content_deduper.is_duplicate(contact_key, content):
+        rawid_hint = str(data.get("rawid", "") or "") if content == "[图片]" else ""
+        if self._state.content_deduper.is_duplicate(contact_key, content, rawid_hint):
             return
 
         # 5. chat/正则过滤
@@ -355,6 +362,8 @@ class WeChatBridge:
                 self._state.content_deduper.is_duplicate(contact_key, merged_content)
 
                 rawid = str(merged_data.get("rawid", "") or "")
+                external_message_id = rawid or None
+                dedupe_key = rawid or None
 
             # 锁外执行网络注入，避免网络耗时阻塞其它缓冲的合并
             result = await self._ctx.gateway.route_message(
@@ -364,8 +373,8 @@ class WeChatBridge:
                     "self_id": self._config.bot.wxid,
                     "connection_id": SCOPE,
                 },
-                external_message_id=rawid,
-                dedupe_key=rawid,
+                external_message_id=external_message_id,
+                dedupe_key=dedupe_key,
             )
             if not result:
                 self._logger.debug(

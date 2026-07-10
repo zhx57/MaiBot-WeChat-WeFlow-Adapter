@@ -44,7 +44,9 @@ def resolve_contact(
     if user_id:
         candidates.append(("user_id", str(user_id)))
 
-    additional_config = message.get("additional_config") or {}
+    additional_config = (message.get("additional_config") or {}) | (
+        message_info.get("additional_config") or {}
+    )
     target_group_id = additional_config.get("platform_io_target_group_id")
     if target_group_id:
         candidates.append(("platform_io_target_group_id", str(target_group_id)))
