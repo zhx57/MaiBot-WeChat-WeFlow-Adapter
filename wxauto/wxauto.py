@@ -339,7 +339,7 @@ class WeChat(WeChatBase):
                 if chat_names_equal(item_name, actual_name):
                     items.append(item)
             if len(items) == 1:
-                items[0].Click(simulateMove=False)
+                items[0].Click(simulateMove=False, waitTime=0)
                 return actual_name
             wxlog.error(
                 f'无法唯一定位会话控件: raw={who!r}, normalized={normalize_chat_name(who)!r}')
@@ -348,11 +348,11 @@ class WeChat(WeChatBase):
             wxlog.error(f'会话列表中有多个规范化同名目标，拒绝选择: {who!r}')
             return False
         else:
-            self.UiaAPI.SendKeys('{Ctrl}f', waitTime=1)
-            self.B_Search.SendKeys('{Ctrl}a', waitTime=0.1)
-            self.B_Search.SendKeys('{Delete}', waitTime=0.1)
+            self.UiaAPI.SendKeys('{Ctrl}f', waitTime=0.05)
+            self.B_Search.SendKeys('{Ctrl}a', waitTime=0)
+            self.B_Search.SendKeys('{Delete}', waitTime=0)
             SetClipboardText(who)
-            self.B_Search.SendKeys('{Ctrl}v', waitTime=1.5)
+            self.B_Search.SendKeys('{Ctrl}v', waitTime=0.05)
             wanted = normalize_chat_name(who)
             candidates = []
             for node in GetAllControl(self.SessionBox):
@@ -368,11 +368,11 @@ class WeChat(WeChatBase):
                 exact = candidates
             if exact:
                 target_control, actual_name = exact[0]
-                target_control.Click(simulateMove=False)
+                target_control.Click(simulateMove=False, waitTime=0)
                 return actual_name
             wxlog.error(f'未找到规范化匹配目标: raw={who!r} normalized={wanted!r}')
-            self.B_Search.SendKeys('{Ctrl}a', waitTime=0.1)
-            self.B_Search.SendKeys('{Delete}', waitTime=0.1)
+            self.B_Search.SendKeys('{Ctrl}a', waitTime=0)
+            self.B_Search.SendKeys('{Delete}', waitTime=0)
             self._refresh()
             return False
     

@@ -3,10 +3,12 @@ from .languages import *
 from .utils import *
 from .color import *
 from .errors import *
+import ctypes
 import datetime
 import time
 import os
 import re
+import win32con
 
 from chat_name_utils import normalize_chat_name
 
@@ -197,7 +199,6 @@ class ChatWnd(WeChatBase):
         self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=self.uia_name)
         self.editbox = self.UiaAPI.EditControl()
         self.C_MsgList = self.UiaAPI.ListControl()
-        self.GetAllMessage()
 
         self.savepic = False   # 该参数用于在自动监听的情况下是否自动保存聊天图片
 
@@ -206,10 +207,20 @@ class ChatWnd(WeChatBase):
 
     def _show(self):
         self.HWND = FindWindow(name=self.uia_name, classname='ChatWnd')
-        win32gui.ShowWindow(self.HWND, 1)
-        win32gui.SetWindowPos(self.HWND, -1, 0, 0, 0, 0, 3)
-        win32gui.SetWindowPos(self.HWND, -2, 0, 0, 0, 0, 3)
-        self.UiaAPI.SwitchToThisWindow()
+        if not self.HWND:
+            return
+        win32gui.ShowWindow(self.HWND, win32con.SW_RESTORE)
+        user32 = ctypes.windll.user32
+        target_tid = user32.GetWindowThreadProcessId(self.HWND, None)
+        current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = current_tid != target_tid and bool(
+            user32.AttachThreadInput(current_tid, target_tid, True))
+        try:
+            win32gui.SetForegroundWindow(self.HWND)
+            win32gui.BringWindowToTop(self.HWND)
+        finally:
+            if attached:
+                user32.AttachThreadInput(current_tid, target_tid, False)
 
     def AtAll(self, msg=None):
         """@所有人
@@ -243,28 +254,33 @@ class ChatWnd(WeChatBase):
         wxlog.debug(f"发送消息：{self.who} --> {msg}")
         self._show()
         if not self.editbox.HasKeyboardFocus:
-            self.editbox.Click(simulateMove=False)
+            self.editbox.Click(simulateMove=False, waitTime=0)
 
         if at:
             if isinstance(at, str):
                 at = [at]
             for i in at:
-                self.editbox.SendKeys('@'+i)
+                self.editbox.SendKeys('@'+i, waitTime=0)
                 atwnd = self.UiaAPI.PaneControl(ClassName='ChatContactMenu')
                 if atwnd.Exists(maxSearchSeconds=0.1):
-                    atwnd.SendKeys('{ENTER}')
+                    atwnd.SendKeys('{ENTER}', waitTime=0)
                     if msg and not msg.startswith('\n'):
                         msg = '\n' + msg
 
         t0 = time.time()
+        value_pattern = self.editbox.GetValuePattern()
         while True:
             if time.time() - t0 > 10:
                 raise TimeoutError(f'发送消息超时 --> {self.who} - {msg}')
-            SetClipboardText(msg)
-            self.editbox.SendKeys('{Ctrl}v')
-            if self.editbox.GetValuePattern().Value:
-                break
-        self.editbox.SendKeys('{Enter}')
+            try:
+                SetClipboardText(msg)
+                self.editbox.SendKeys('{Ctrl}v', waitTime=0)
+                if value_pattern.Value:
+                    break
+            except Exception:
+                value_pattern = self.editbox.GetValuePattern()
+            time.sleep(0.02)
+        self.editbox.SendKeys('{Enter}', waitTime=0)
 
     def SendFiles(self, filepath):
         """向当前聊天窗口发送文件
@@ -297,15 +313,20 @@ class ChatWnd(WeChatBase):
             self._show()
             self.editbox.SendKeys('{Ctrl}a', waitTime=0)
             t0 = time.time()
+            value_pattern = self.editbox.GetValuePattern()
             while True:
                 if time.time() - t0 > 10:
                     raise TimeoutError(f'发送文件超时 --> {filelist}')
-                SetClipboardFiles(filelist)
-                time.sleep(0.2)
-                self.editbox.SendKeys('{Ctrl}v')
-                if self.editbox.GetValuePattern().Value:
-                    break
-            self.editbox.SendKeys('{Enter}')
+                try:
+                    SetClipboardFiles(filelist)
+                    time.sleep(0.05)
+                    self.editbox.SendKeys('{Ctrl}v', waitTime=0)
+                    if value_pattern.Value:
+                        break
+                except Exception:
+                    value_pattern = self.editbox.GetValuePattern()
+                time.sleep(0.02)
+            self.editbox.SendKeys('{Enter}', waitTime=0)
             return True
         else:
             Warnings.lightred('所有文件都无法成功发送', stacklevel=2)

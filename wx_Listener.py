@@ -224,10 +224,22 @@ class WeChatListener:
             raise
 
     def _ensure_chatwnd(self, receiver):
+        key = normalize_chat_name(receiver)
+        chat = self._chatwnd_cache.get(key)
+        if chat is not None:
+            import win32gui
+
+            hwnd = getattr(chat, "HWND", None)
+            if not hwnd:
+                hwnd = win32gui.FindWindow("ChatWnd", chat.uia_name)
+                chat.HWND = hwnd
+            if hwnd and win32gui.IsWindow(hwnd):
+                return chat
+            self._chatwnd_cache.pop(key, None)
+
         from wxauto.elements import ChatWnd
         from wxauto import uiautomation as uia
 
-        key = normalize_chat_name(receiver)
         windows = [window for window in uia.GetRootControl().GetChildren()
                    if getattr(window, "ClassName", "") == "ChatWnd"
                    and normalize_chat_name(getattr(window, "Name", "")) == key]
@@ -260,14 +272,12 @@ class WeChatListener:
                            and normalize_chat_name(getattr(window, "Name", "")) == key]
                 if len(windows) == 1:
                     break
-                time.sleep(0.1)
+                time.sleep(0.03)
             if len(windows) != 1:
                 raise RuntimeError(
                     f"独立聊天窗口未出现: raw={receiver!r} normalized={key!r}")
-        chat = self._chatwnd_cache.get(key)
-        if chat is None:
-            chat = ChatWnd(receiver, self.wx.language, uia_name=windows[0].Name)
-            self._chatwnd_cache[key] = chat
+        chat = ChatWnd(receiver, self.wx.language, uia_name=windows[0].Name)
+        self._chatwnd_cache[key] = chat
         return chat
 
     def _add_listen_chat(self, name, max_retries=3):
