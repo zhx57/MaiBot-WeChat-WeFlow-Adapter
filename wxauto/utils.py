@@ -202,6 +202,38 @@ def GetAllWindowExs(HWND):
 def FindWindow(classname=None, name=None) -> int:
     return win32gui.FindWindow(classname, name)
 
+
+def ActivateWindow(hwnd) -> bool:
+    """Show and foreground a window, doing no work when it is already active."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    elif not win32gui.IsWindowVisible(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+
+    if win32gui.GetForegroundWindow() == hwnd:
+        return True
+
+    user32 = ctypes.windll.user32
+    target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+    current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+    attached = current_tid != target_tid and bool(
+        user32.AttachThreadInput(current_tid, target_tid, True))
+    is_foreground = False
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        is_foreground = win32gui.GetForegroundWindow() == hwnd
+        if not is_foreground:
+            win32gui.BringWindowToTop(hwnd)
+            is_foreground = win32gui.GetForegroundWindow() == hwnd
+    finally:
+        if attached:
+            user32.AttachThreadInput(current_tid, target_tid, False)
+    return is_foreground
+
+
 def FindWinEx(HWND, classname=None, name=None) -> list:
     hwnds_classname = []
     hwnds_name = []

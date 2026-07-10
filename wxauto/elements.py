@@ -3,12 +3,10 @@ from .languages import *
 from .utils import *
 from .color import *
 from .errors import *
-import ctypes
 import datetime
 import time
 import os
 import re
-import win32con
 
 from chat_name_utils import normalize_chat_name
 
@@ -190,7 +188,7 @@ class WeChatBase:
 
 
 class ChatWnd(WeChatBase):
-    def __init__(self, who, language='cn', uia_name=None):
+    def __init__(self, who, language='cn', uia_name=None, hwnd=None):
         self.who = who
         self.uia_name = uia_name or who
         self.chat_key = normalize_chat_name(who)
@@ -199,6 +197,7 @@ class ChatWnd(WeChatBase):
         self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=self.uia_name)
         self.editbox = self.UiaAPI.EditControl()
         self.C_MsgList = self.UiaAPI.ListControl()
+        self.HWND = hwnd
 
         self.savepic = False   # 该参数用于在自动监听的情况下是否自动保存聊天图片
 
@@ -206,21 +205,10 @@ class ChatWnd(WeChatBase):
         return f"<wxauto Chat Window at {hex(id(self))} for {self.who}>"
 
     def _show(self):
+        if ActivateWindow(self.HWND):
+            return True
         self.HWND = FindWindow(name=self.uia_name, classname='ChatWnd')
-        if not self.HWND:
-            return
-        win32gui.ShowWindow(self.HWND, win32con.SW_RESTORE)
-        user32 = ctypes.windll.user32
-        target_tid = user32.GetWindowThreadProcessId(self.HWND, None)
-        current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-        attached = current_tid != target_tid and bool(
-            user32.AttachThreadInput(current_tid, target_tid, True))
-        try:
-            win32gui.SetForegroundWindow(self.HWND)
-            win32gui.BringWindowToTop(self.HWND)
-        finally:
-            if attached:
-                user32.AttachThreadInput(current_tid, target_tid, False)
+        return ActivateWindow(self.HWND)
 
     def AtAll(self, msg=None):
         """@所有人
@@ -267,10 +255,10 @@ class ChatWnd(WeChatBase):
                     if msg and not msg.startswith('\n'):
                         msg = '\n' + msg
 
-        t0 = time.time()
+        deadline = time.monotonic() + 10
         value_pattern = self.editbox.GetValuePattern()
         while True:
-            if time.time() - t0 > 10:
+            if time.monotonic() >= deadline:
                 raise TimeoutError(f'发送消息超时 --> {self.who} - {msg}')
             try:
                 SetClipboardText(msg)
@@ -312,14 +300,13 @@ class ChatWnd(WeChatBase):
         if filelist:
             self._show()
             self.editbox.SendKeys('{Ctrl}a', waitTime=0)
-            t0 = time.time()
+            deadline = time.monotonic() + 10
             value_pattern = self.editbox.GetValuePattern()
             while True:
-                if time.time() - t0 > 10:
+                if time.monotonic() >= deadline:
                     raise TimeoutError(f'发送文件超时 --> {filelist}')
                 try:
                     SetClipboardFiles(filelist)
-                    time.sleep(0.05)
                     self.editbox.SendKeys('{Ctrl}v', waitTime=0)
                     if value_pattern.Value:
                         break

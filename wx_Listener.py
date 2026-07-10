@@ -67,6 +67,7 @@ class UICommandTimeout(TimeoutError):
 class UICommandQueue:
     def __init__(self, maxsize=UI_QUEUE_SIZE):
         self._queue = queue.Queue(maxsize=maxsize)
+        self._wake_event = threading.Event()
 
     def submit(self, action, *args, timeout=15):
         command = UICommand(action=action, args=args, timeout=float(timeout))
@@ -74,6 +75,7 @@ class UICommandQueue:
             self._queue.put(command, timeout=2)
         except queue.Full as exc:
             raise RuntimeError("UI 命令队列已满") from exc
+        self._wake_event.set()
         try:
             return command.future.result(timeout=timeout)
         except FutureTimeoutError as exc:
@@ -89,6 +91,12 @@ class UICommandQueue:
 
     def task_done(self):
         self._queue.task_done()
+
+    def wait(self, timeout):
+        """Sleep until a command arrives, retaining the listener poll timeout."""
+        if self._queue.empty():
+            self._wake_event.wait(timeout)
+        self._wake_event.clear()
 
 
 class WeChatListener:
@@ -173,7 +181,7 @@ class WeChatListener:
                     lost_since = None
             self._check_new_messages()
             self._retry_failed_chats()
-            time.sleep(0.2)
+            self.commands.wait(0.2)
 
     def stop_listening(self):
         self.running = False
@@ -276,7 +284,12 @@ class WeChatListener:
             if len(windows) != 1:
                 raise RuntimeError(
                     f"独立聊天窗口未出现: raw={receiver!r} normalized={key!r}")
-        chat = ChatWnd(receiver, self.wx.language, uia_name=windows[0].Name)
+        chat = ChatWnd(
+            receiver,
+            self.wx.language,
+            uia_name=windows[0].Name,
+            hwnd=getattr(windows[0], "NativeWindowHandle", None),
+        )
         self._chatwnd_cache[key] = chat
         return chat
 

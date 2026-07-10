@@ -97,11 +97,10 @@ class WeChat(WeChatBase):
     
     
     def _show(self):
+        if ActivateWindow(getattr(self, 'HWND', None)):
+            return True
         self.HWND = FindWindow(classname='WeChatMainWndForPC')
-        win32gui.ShowWindow(self.HWND, 1)
-        win32gui.SetWindowPos(self.HWND, -1, 0, 0, 0, 0, 3)
-        win32gui.SetWindowPos(self.HWND, -2, 0, 0, 0, 0, 3)
-        self.UiaAPI.SwitchToThisWindow()
+        return ActivateWindow(self.HWND)
 
     def _refresh(self):
         self.UiaAPI.SendKeys('{Ctrl}{Alt}w')
@@ -348,18 +347,24 @@ class WeChat(WeChatBase):
             wxlog.error(f'会话列表中有多个规范化同名目标，拒绝选择: {who!r}')
             return False
         else:
-            self.UiaAPI.SendKeys('{Ctrl}f', waitTime=0.05)
+            self.UiaAPI.SendKeys('{Ctrl}f', waitTime=0)
             self.B_Search.SendKeys('{Ctrl}a', waitTime=0)
             self.B_Search.SendKeys('{Delete}', waitTime=0)
             SetClipboardText(who)
-            self.B_Search.SendKeys('{Ctrl}v', waitTime=0.05)
+            self.B_Search.SendKeys('{Ctrl}v', waitTime=0)
             wanted = normalize_chat_name(who)
+            deadline = time.monotonic() + timeout
             candidates = []
-            for node in GetAllControl(self.SessionBox):
-                name = getattr(node, 'Name', '')
-                plain_name = name.replace('<em>', '').replace('</em>', '')
-                if normalize_chat_name(plain_name) == wanted:
-                    candidates.append((node, plain_name))
+            while True:
+                candidates = []
+                for node in GetAllControl(self.SessionBox):
+                    name = getattr(node, 'Name', '')
+                    plain_name = name.replace('<em>', '').replace('</em>', '')
+                    if normalize_chat_name(plain_name) == wanted:
+                        candidates.append((node, plain_name))
+                if candidates or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
             # The same result can expose nested controls with the same name. Prefer
             # the highlighted text control, but reject distinct normalized names.
             exact = [(node, name) for node, name in candidates
