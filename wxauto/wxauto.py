@@ -37,6 +37,7 @@ class WeChat(WeChatBase):
         """
         self.UiaAPI: uia.WindowControl = uia.WindowControl(ClassName='WeChatMainWndForPC', searchDepth=1)
         self.listen = {}
+        self.listen_errors = {}
         self.SessionItemList = []
         set_debug(debug)
         self.language = language
@@ -614,7 +615,11 @@ class WeChat(WeChatBase):
             if window is None:
                 raise TargetNotFoundError(
                     f'独立聊天窗口未出现：raw={who!r}, normalized={key!r}')
-        chat = ChatWnd(who, self.language, uia_name=window.Name)
+        hwnd = getattr(window, 'NativeWindowHandle', None)
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            raise TargetNotFoundError(
+                f'监听窗口句柄无效：raw={who!r}, normalized={key!r}, HWND={hwnd!r}')
+        chat = ChatWnd(who, self.language, uia_name=window.Name, hwnd=hwnd)
         if not chat.UiaAPI.Exists(maxSearchSeconds=2):
             raise TargetNotFoundError(
                 f'监听窗口校验失败：raw={who!r}, normalized={key!r}, UIA={window.Name!r}')
@@ -633,14 +638,27 @@ class WeChat(WeChatBase):
             str|dict: 如果
         """
         key = normalize_chat_name(who) if who else None
+        self.listen_errors = {}
         if key and key in self.listen:
             chat = self.listen[key]
-            msg = chat.GetNewMessage(savepic=chat.savepic, savefile=chat.savefile, savevoice=chat.savevoice)
-            return msg
+            try:
+                return chat.GetNewMessage(
+                    savepic=chat.savepic, savefile=chat.savefile,
+                    savevoice=chat.savevoice)
+            except Exception as exc:
+                self.listen_errors[key] = exc
+                wxlog.warning(f'读取监听消息失败，已隔离该聊天：{chat.who}: {exc}')
+                return []
         msgs = {}
-        for key in self.listen:
-            chat = self.listen[key]
-            msg = chat.GetNewMessage(savepic=chat.savepic, savefile=chat.savefile, savevoice=chat.savevoice)
+        for key, chat in list(self.listen.items()):
+            try:
+                msg = chat.GetNewMessage(
+                    savepic=chat.savepic, savefile=chat.savefile,
+                    savevoice=chat.savevoice)
+            except Exception as exc:
+                self.listen_errors[key] = exc
+                wxlog.warning(f'读取监听消息失败，已隔离该聊天：{chat.who}: {exc}')
+                continue
             if msg:
                 msgs[chat] = msg
         return msgs

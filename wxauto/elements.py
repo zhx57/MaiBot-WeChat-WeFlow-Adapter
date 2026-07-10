@@ -201,6 +201,20 @@ class ChatWnd(WeChatBase):
 
         self.savepic = False   # 该参数用于在自动监听的情况下是否自动保存聊天图片
 
+    def Rebind(self, uia_name=None, hwnd=None):
+        """Recreate UIA controls after the underlying chat window changes."""
+        if uia_name:
+            self.uia_name = uia_name
+        self.UiaAPI = uia.WindowControl(
+            searchDepth=1, ClassName='ChatWnd', Name=self.uia_name)
+        self.editbox = self.UiaAPI.EditControl()
+        self.C_MsgList = self.UiaAPI.ListControl()
+        self.HWND = hwnd
+        # RuntimeIds belong to the old UIA tree. Starting with an empty set makes
+        # the first poll establish a fresh baseline instead of replaying history.
+        self.usedmsgid = []
+        return self
+
     def __repr__(self) -> str:
         return f"<wxauto Chat Window at {hex(id(self))} for {self.who}>"
 
@@ -209,6 +223,10 @@ class ChatWnd(WeChatBase):
             return True
         self.HWND = FindWindow(name=self.uia_name, classname='ChatWnd')
         return ActivateWindow(self.HWND)
+
+    def Close(self):
+        if self._show():
+            self.UiaAPI.SendKeys('{Alt}{F4}', waitTime=0)
 
     def AtAll(self, msg=None):
         """@所有人
