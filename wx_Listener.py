@@ -2,7 +2,6 @@
 
 import logging
 import queue
-import re
 import threading
 import time
 import uuid
@@ -10,6 +9,8 @@ from dataclasses import dataclass, field
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
+
+from chat_name_utils import chat_names_equal, normalize_chat_name
 
 from config import (
     IMAGE_AUTO_DOWNLOAD,
@@ -106,9 +107,9 @@ class WeChatListener:
         self.stop_event = stop_event
         self.heartbeat = heartbeat
         self.listen_chats = {}
-        self.chat_types = {item["name"]: item.get("type") for item in self.target_specs
+        self.chat_types = {normalize_chat_name(item["name"]): item.get("type") for item in self.target_specs
                            if item.get("type") in {"private", "group"}}
-        self._failed_chats = set()
+        self._failed_chats = {}
         self._last_retry_time = 0
         self._chatwnd_cache = {}
         self.running = False
@@ -128,8 +129,9 @@ class WeChatListener:
                     raise ValueError(f"无效聊天类型: {chat_type!r}")
             else:
                 raise TypeError("聊天配置必须是字符串或 {name,type} 字典")
-            if name and name not in seen:
-                seen.add(name)
+            key = normalize_chat_name(name)
+            if name and key not in seen:
+                seen.add(key)
                 result.append({"name": name, "type": chat_type})
         return result
 
@@ -218,62 +220,77 @@ class WeChatListener:
                 raise RuntimeError("SendFiles 返回 False")
             return True
         except Exception:
-            self._chatwnd_cache.pop(receiver, None)
+            self._chatwnd_cache.pop(normalize_chat_name(receiver), None)
             raise
 
     def _ensure_chatwnd(self, receiver):
         from wxauto.elements import ChatWnd
-        from wxauto.utils import FindWindow
+        from wxauto import uiautomation as uia
 
-        escaped = f"^{re.escape(receiver)}$"
-        if not FindWindow(name=receiver, classname="ChatWnd"):
+        key = normalize_chat_name(receiver)
+        windows = [window for window in uia.GetRootControl().GetChildren()
+                   if getattr(window, "ClassName", "") == "ChatWnd"
+                   and normalize_chat_name(getattr(window, "Name", "")) == key]
+        if len(windows) > 1:
+            raise RuntimeError(f"存在多个规范化同名窗口: raw={receiver!r} normalized={key!r}")
+        if not windows:
             selected = self.wx.ChatWith(receiver)
-            if selected is False or selected != receiver:
-                raise RuntimeError(f"ChatWith 未精确打开目标: {receiver!r}, result={selected!r}")
-            matches = [item for item in self.wx.SessionBox.ListControl().GetChildren()
-                       if getattr(item, "Name", None) == receiver]
+            if selected is False or not chat_names_equal(selected, receiver):
+                raise RuntimeError(
+                    f"ChatWith 未精确打开目标: raw={receiver!r} normalized={key!r} "
+                    f"result={selected!r}")
+            matches = []
+            for item in self.wx.SessionBox.ListControl().GetChildren():
+                try:
+                    item_name, _ = self.wx.GetSessionAmont(item)
+                except Exception:
+                    continue
+                if chat_names_equal(item_name, receiver):
+                    matches.append(item)
             if len(matches) > 1:
                 raise RuntimeError(f"存在 {len(matches)} 个同名会话，拒绝自动选择: {receiver!r}")
-            control = self.wx.SessionBox.ListItemControl(RegexName=escaped)
-            if not control.Exists(maxSearchSeconds=2):
-                raise RuntimeError(f"会话列表中不存在精确目标: {receiver!r}")
-            control.DoubleClick(simulateMove=False)
-            window = self.wx.UiaAPI.WindowControl(searchDepth=1, ClassName="ChatWnd", Name=receiver)
-            if not window.Exists(maxSearchSeconds=5):
-                raise RuntimeError(f"独立聊天窗口未出现: {receiver!r}")
-        chat = self._chatwnd_cache.get(receiver)
+            if not matches:
+                raise RuntimeError(
+                    f"会话列表中不存在目标: raw={receiver!r} normalized={key!r}")
+            matches[0].DoubleClick(simulateMove=False)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                windows = [window for window in uia.GetRootControl().GetChildren()
+                           if getattr(window, "ClassName", "") == "ChatWnd"
+                           and normalize_chat_name(getattr(window, "Name", "")) == key]
+                if len(windows) == 1:
+                    break
+                time.sleep(0.1)
+            if len(windows) != 1:
+                raise RuntimeError(
+                    f"独立聊天窗口未出现: raw={receiver!r} normalized={key!r}")
+        chat = self._chatwnd_cache.get(key)
         if chat is None:
-            chat = object.__new__(ChatWnd)
-            chat.who = receiver
-            chat.language = self.wx.language
-            chat.usedmsgid = []
-            from wxauto import uiautomation as uia
-            chat.UiaAPI = uia.WindowControl(searchDepth=1, ClassName="ChatWnd", Name=receiver)
-            chat.editbox = chat.UiaAPI.EditControl()
-            chat.C_MsgList = chat.UiaAPI.ListControl()
-            chat.savepic = False
-            self._chatwnd_cache[receiver] = chat
+            chat = ChatWnd(receiver, self.wx.language, uia_name=windows[0].Name)
+            self._chatwnd_cache[key] = chat
         return chat
 
     def _add_listen_chat(self, name, max_retries=3):
         self._assert_ui_thread()
+        key = normalize_chat_name(name)
         for attempt in range(1, max_retries + 1):
             try:
                 self._clear_search_box()
                 self.wx.AddListenChat(name, savepic=IMAGE_AUTO_DOWNLOAD,
                                       savefile=False, savevoice=False)
-                chat = self.wx.listen.get(name)
+                chat = self.wx.listen.get(key)
                 if chat is None or not chat.UiaAPI.Exists(maxSearchSeconds=2):
                     raise RuntimeError("AddListenChat 未创建有效窗口")
-                if getattr(chat, "who", None) != name:
-                    raise RuntimeError("监听窗口标题与目标不匹配")
-                detected = self.chat_types.get(name) or self._detect_chat_type(chat)
+                if not chat_names_equal(getattr(chat, "who", None), name):
+                    raise RuntimeError(
+                        f"监听窗口标题与目标不匹配 raw={name!r} normalized={key!r}")
+                detected = self.chat_types.get(key) or self._detect_chat_type(chat)
                 if detected not in {"private", "group"}:
                     raise RuntimeError("聊天类型不确定；请显式配置 {name,type}，拒绝监听")
-                self.chat_types[name] = detected
-                self.listen_chats[name] = True
-                self._failed_chats.discard(name)
-                logger.info("监听已建立 chat=%s type=%s", name, self.chat_types[name])
+                self.chat_types[key] = detected
+                self.listen_chats[key] = name
+                self._failed_chats.pop(key, None)
+                logger.info("监听已建立 chat=%s normalized=%r type=%s", name, key, detected)
                 return True
             except Exception as exc:
                 logger.warning("添加监听失败 chat=%s attempt=%d/%d: %s",
@@ -281,7 +298,7 @@ class WeChatListener:
                 self._remove_listen(name)
                 if attempt < max_retries:
                     time.sleep(attempt)
-        self._failed_chats.add(name)
+        self._failed_chats[key] = name
         return False
 
     def _detect_chat_type(self, chat):
@@ -303,19 +320,25 @@ class WeChatListener:
         try:
             all_messages = self.wx.GetListenMessage() or {}
             for chat, messages in all_messages.items():
+                key = normalize_chat_name(chat.who)
+                configured_name = self.listen_chats.get(key)
+                if configured_name is None:
+                    logger.warning("忽略未注册监听消息 raw=%r normalized=%r", chat.who, key)
+                    continue
                 for message in messages or []:
-                    self._process_message(chat.who, message)
+                    self._process_message(configured_name, message)
             self._msg_fail_count = 0
         except Exception:
             self._msg_fail_count = getattr(self, "_msg_fail_count", 0) + 1
             logger.exception("检查微信消息失败 count=%d", self._msg_fail_count)
             if self._msg_fail_count >= 5:
-                names = list(self.listen_chats)
+                failed = dict(self.listen_chats)
                 self._cleanup_listeners()
-                self._failed_chats.update(names)
+                self._failed_chats.update(failed)
                 self._msg_fail_count = 0
 
     def _process_message(self, chat_name, message):
+        key = normalize_chat_name(chat_name)
         msg_type = str(getattr(message, "type", ""))
         sender = getattr(message, "sender", None)
         content = getattr(message, "content", None)
@@ -328,7 +351,7 @@ class WeChatListener:
         if msg_type == "sys" and ("新消息" in content or
                                   (len(content.strip()) <= 10 and ":" in content)):
             return
-        data = {"chat": chat_name, "chat_type": self.chat_types.get(chat_name),
+        data = {"chat": chat_name, "chat_type": self.chat_types.get(key),
                 "sender": str(sender or "未知用户"), "type": msg_type,
                 "content": content, "timestamp": datetime.now().isoformat()}
         logger.info("收到微信消息 chat=%s type=%s length=%d", chat_name, msg_type, len(content))
@@ -340,7 +363,7 @@ class WeChatListener:
         if not self._failed_chats or now - self._last_retry_time < 30:
             return
         self._last_retry_time = now
-        for name in list(self._failed_chats):
+        for name in list(self._failed_chats.values()):
             self._add_listen_chat(name, max_retries=1)
 
     def _clear_search_box(self):
@@ -363,15 +386,16 @@ class WeChatListener:
             return False
 
     def _remove_listen(self, name):
-        chat = self.wx.listen.get(name)
+        key = normalize_chat_name(name)
+        chat = self.wx.listen.get(key)
         if chat:
             try:
                 chat.Close()
             except Exception:
                 logger.debug("关闭旧监听窗口失败 chat=%s", name, exc_info=True)
         self.wx.RemoveListenChat(name)
-        self.listen_chats.pop(name, None)
-        self._chatwnd_cache.pop(name, None)
+        self.listen_chats.pop(key, None)
+        self._chatwnd_cache.pop(key, None)
 
     def _cleanup_listeners(self):
         for name in list(self.wx.listen):
@@ -388,7 +412,7 @@ class WeChatListener:
         try:
             desired = [item["name"] for item in self.target_specs]
             if not desired and WX_LISTEN_ALL_IF_EMPTY:
-                desired = list(self.listen_chats)
+                desired = list(self.listen_chats.values())
             self._cleanup_wechat()
             self.wx = self._wechat_class()
             if not desired and not WX_LISTEN_ALL_IF_EMPTY:

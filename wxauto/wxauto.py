@@ -14,6 +14,7 @@ import time
 import os
 import re
 import logging
+from chat_name_utils import chat_names_equal, normalize_chat_name
 try:
     from typing import Literal
 except:
@@ -325,36 +326,55 @@ class WeChat(WeChatBase):
         '''
         self._show()
         sessiondict = self.GetSessionList(True)
-        if who in list(sessiondict.keys())[:-1]:
-            self.SessionBox.ListItemControl(RegexName=f'^{re.escape(who)}$').Click(simulateMove=False)
-            return who
+        session_matches = [name for name in list(sessiondict.keys())[:-1]
+                           if chat_names_equal(name, who)]
+        if len(session_matches) == 1:
+            actual_name = session_matches[0]
+            items = []
+            for item in self.SessionBox.ListControl().GetChildren():
+                try:
+                    item_name, _ = self.GetSessionAmont(item)
+                except Exception:
+                    continue
+                if chat_names_equal(item_name, actual_name):
+                    items.append(item)
+            if len(items) == 1:
+                items[0].Click(simulateMove=False)
+                return actual_name
+            wxlog.error(
+                f'无法唯一定位会话控件: raw={who!r}, normalized={normalize_chat_name(who)!r}')
+            return False
+        elif len(session_matches) > 1:
+            wxlog.error(f'会话列表中有多个规范化同名目标，拒绝选择: {who!r}')
+            return False
         else:
             self.UiaAPI.SendKeys('{Ctrl}f', waitTime=1)
-            self.B_Search.SendKeys(who, waitTime=1.5)
-            # 搜索结果可能包含多个同名联系人/群；没有稳定微信 ID 时必须拒绝猜测。
-            exact = [item for item in self.SessionBox.GetChildren()
-                     for node in ([item] + list(item.GetChildren()))
-                     if getattr(node, 'Name', None) in {who, f'<em>{who}</em>'}]
-            if len(exact) > 1:
-                wxlog.error(f'搜索到多个同名目标，拒绝选择: {who}')
-                self._refresh()
-                return False
-            target_control = self.SessionBox.TextControl(Name=f"<em>{who}</em>")
-            if target_control.Exists(timeout):
-                wxlog.debug('选择完全匹配项')
+            self.B_Search.SendKeys('{Ctrl}a', waitTime=0.1)
+            self.B_Search.SendKeys('{Delete}', waitTime=0.1)
+            SetClipboardText(who)
+            self.B_Search.SendKeys('{Ctrl}v', waitTime=1.5)
+            wanted = normalize_chat_name(who)
+            candidates = []
+            for node in GetAllControl(self.SessionBox):
+                name = getattr(node, 'Name', '')
+                plain_name = name.replace('<em>', '').replace('</em>', '')
+                if normalize_chat_name(plain_name) == wanted:
+                    candidates.append((node, plain_name))
+            # The same result can expose nested controls with the same name. Prefer
+            # the highlighted text control, but reject distinct normalized names.
+            exact = [(node, name) for node, name in candidates
+                     if getattr(node, 'ControlTypeName', '') == 'TextControl']
+            if not exact:
+                exact = candidates
+            if exact:
+                target_control, actual_name = exact[0]
                 target_control.Click(simulateMove=False)
-                return who
-            else:
-                search_result_control = self.SessionBox.GetChildren()[1].GetChildren()[1].GetFirstChildControl()
-                if not search_result_control.PaneControl(searchDepth=1).TextControl(RegexName='联系人|群聊').Exists(0.1):
-                    wxlog.debug(f'未找到搜索结果: {who}')
-                    self._refresh()
-                    return False
-                wxlog.debug('选择搜索结果第一个')
-                target_control = search_result_control.Control(RegexName=f'.*{who}.*')
-                chatname = target_control.Name
-                target_control.Click(simulateMove=False)
-                return chatname
+                return actual_name
+            wxlog.error(f'未找到规范化匹配目标: raw={who!r} normalized={wanted!r}')
+            self.B_Search.SendKeys('{Ctrl}a', waitTime=0.1)
+            self.B_Search.SendKeys('{Delete}', waitTime=0.1)
+            self._refresh()
+            return False
     
     def AtAll(self, msg=None, who=None):
         """@所有人
@@ -549,29 +569,54 @@ class WeChat(WeChatBase):
             savefile (bool, optional): 是否自动保存聊天文件，只针对该聊天对象有效
             savevoice (bool, optional): 是否自动保存聊天语音，只针对该聊天对象有效
         """
-        exists = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who).Exists(maxSearchSeconds=0.1)
+        key = normalize_chat_name(who)
+        windows = [window for window in uia.GetRootControl().GetChildren()
+                   if getattr(window, 'ClassName', '') == 'ChatWnd'
+                   and normalize_chat_name(getattr(window, 'Name', '')) == key]
+        if len(windows) > 1:
+            raise TargetNotFoundError(f'存在多个规范化同名窗口：raw={who!r}, normalized={key!r}')
+        window = windows[0] if windows else None
+        exists = bool(window)
         if not exists:
             selected = self.ChatWith(who)
-            if selected is False or selected != who:
-                raise TargetNotFoundError(f'未精确打开监听目标：{who}')
-            matches = [item for item in self.SessionBox.ListControl().GetChildren()
-                       if getattr(item, 'Name', None) == who]
+            if selected is False or not chat_names_equal(selected, who):
+                raise TargetNotFoundError(
+                    f'未精确打开监听目标：raw={who!r}, normalized={key!r}, result={selected!r}')
+            matches = []
+            for candidate in self.SessionBox.ListControl().GetChildren():
+                try:
+                    candidate_name, _ = self.GetSessionAmont(candidate)
+                except Exception:
+                    continue
+                if chat_names_equal(candidate_name, who):
+                    matches.append(candidate)
             if len(matches) > 1:
-                raise TargetNotFoundError(f'存在多个同名会话，拒绝自动选择：{who}')
-            item = self.SessionBox.ListItemControl(RegexName=f'^{re.escape(who)}$')
-            if not item.Exists(maxSearchSeconds=2):
-                raise TargetNotFoundError(f'会话列表中不存在监听目标：{who}')
+                raise TargetNotFoundError(f'存在多个规范化同名会话，拒绝自动选择：{who!r}')
+            if not matches:
+                raise TargetNotFoundError(
+                    f'会话列表中不存在监听目标：raw={who!r}, normalized={key!r}')
+            item = matches[0]
             item.DoubleClick(simulateMove=False)
-            window = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who)
-            if not window.Exists(maxSearchSeconds=5):
-                raise TargetNotFoundError(f'独立聊天窗口未出现：{who}')
-        chat = ChatWnd(who, self.language)
-        if not chat.UiaAPI.Exists(maxSearchSeconds=2) or chat.who != who:
-            raise TargetNotFoundError(f'监听窗口校验失败：{who}')
-        self.listen[who] = chat
-        self.listen[who].savepic = savepic
-        self.listen[who].savefile = savefile
-        self.listen[who].savevoice = savevoice
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                windows = [candidate for candidate in uia.GetRootControl().GetChildren()
+                           if getattr(candidate, 'ClassName', '') == 'ChatWnd'
+                           and normalize_chat_name(getattr(candidate, 'Name', '')) == key]
+                if len(windows) == 1:
+                    window = windows[0]
+                    break
+                time.sleep(0.1)
+            if window is None:
+                raise TargetNotFoundError(
+                    f'独立聊天窗口未出现：raw={who!r}, normalized={key!r}')
+        chat = ChatWnd(who, self.language, uia_name=window.Name)
+        if not chat.UiaAPI.Exists(maxSearchSeconds=2):
+            raise TargetNotFoundError(
+                f'监听窗口校验失败：raw={who!r}, normalized={key!r}, UIA={window.Name!r}')
+        self.listen[key] = chat
+        self.listen[key].savepic = savepic
+        self.listen[key].savefile = savefile
+        self.listen[key].savevoice = savevoice
 
     def GetListenMessage(self, who=None):
         """获取监听对象的新消息
@@ -582,13 +627,14 @@ class WeChat(WeChatBase):
         Returns:
             str|dict: 如果
         """
-        if who and who in self.listen:
-            chat = self.listen[who]
+        key = normalize_chat_name(who) if who else None
+        if key and key in self.listen:
+            chat = self.listen[key]
             msg = chat.GetNewMessage(savepic=chat.savepic, savefile=chat.savefile, savevoice=chat.savevoice)
             return msg
         msgs = {}
-        for who in self.listen:
-            chat = self.listen[who]
+        for key in self.listen:
+            chat = self.listen[key]
             msg = chat.GetNewMessage(savepic=chat.savepic, savefile=chat.savefile, savevoice=chat.savevoice)
             if msg:
                 msgs[chat] = msg
@@ -678,8 +724,9 @@ class WeChat(WeChatBase):
     
     def RemoveListenChat(self, who):
         """移除监听对象"""
-        if who in self.listen:
-            del self.listen[who]
+        key = normalize_chat_name(who)
+        if key in self.listen:
+            del self.listen[key]
         else:
             Warnings.lightred(f'未找到监听对象：{who}', stacklevel=2)
 

@@ -8,6 +8,8 @@ import time
 import os
 import re
 
+from chat_name_utils import normalize_chat_name
+
 
 
 class WxParam:
@@ -186,11 +188,13 @@ class WeChatBase:
 
 
 class ChatWnd(WeChatBase):
-    def __init__(self, who, language='cn'):
+    def __init__(self, who, language='cn', uia_name=None):
         self.who = who
+        self.uia_name = uia_name or who
+        self.chat_key = normalize_chat_name(who)
         self.language = language
         self.usedmsgid = []
-        self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=who)
+        self.UiaAPI = uia.WindowControl(searchDepth=1, ClassName='ChatWnd', Name=self.uia_name)
         self.editbox = self.UiaAPI.EditControl()
         self.C_MsgList = self.UiaAPI.ListControl()
         self.GetAllMessage()
@@ -201,7 +205,7 @@ class ChatWnd(WeChatBase):
         return f"<wxauto Chat Window at {hex(id(self))} for {self.who}>"
 
     def _show(self):
-        self.HWND = FindWindow(name=self.who, classname='ChatWnd')
+        self.HWND = FindWindow(name=self.uia_name, classname='ChatWnd')
         win32gui.ShowWindow(self.HWND, 1)
         win32gui.SetWindowPos(self.HWND, -1, 0, 0, 0, 0, 3)
         win32gui.SetWindowPos(self.HWND, -2, 0, 0, 0, 0, 3)
