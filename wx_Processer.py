@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -52,6 +53,12 @@ _IMAGE_MAGIC = {
     b"GIF89a": ".gif",
     b"RIFF": ".webp",
 }
+
+_IMAGE_DATA_URI = re.compile(
+    r"^data:image/[a-z0-9.+-]+(?:;[a-z0-9._+-]+(?:=[^;,]*)?)*;base64,",
+    re.IGNORECASE,
+)
+_BASE64_TEXT = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 
 class OutboundDeliveryError(RuntimeError):
@@ -313,31 +320,28 @@ class MessageProcessor:
         return getattr(segment, key, default)
 
     async def _process_segments(self, segment, receiver):
-        seg_type = str(self._segment_value(segment, "type", "")).lower()
+        seg_type = str(self._segment_value(segment, "type", "")).strip().lower()
         data = self._segment_value(segment, "data")
         if seg_type == "seglist":
-            for child in data or []:
+            if data is None:
+                return
+            if not isinstance(data, (list, tuple)):
+                raise ValueError("seglist segment 的 data 必须是数组")
+            for child in data:
                 await self._process_segments(child, receiver)
             return
         if seg_type in {"reply", "notify"}:
             return
         if seg_type == "image":
-            path, temporary = self._prepare_image(data)
-            deferred_cleanup = False
+            await self._send_image_segment(receiver, data)
+            return
+        if seg_type == "emoji":
             try:
-                await self._queue_outbound(receiver, "image", path)
-            except Exception as exc:
-                command_future = getattr(exc, "command_future", None)
-                if temporary and command_future is not None:
-                    self._defer_temporary_cleanup(path, command_future)
-                    deferred_cleanup = True
-                raise
-            finally:
-                if temporary and not deferred_cleanup:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        logger.warning("临时图片清理失败 path=%s", path, exc_info=True)
+                await self._send_image_segment(receiver, data)
+            except ValueError:
+                text = self._textual_emoji(data)
+                if text:
+                    await self._queue_outbound(receiver, "text", text)
             return
         if seg_type == "file":
             path = self._normalize_file(data)
@@ -347,12 +351,45 @@ class MessageProcessor:
             data = f"[@{self._text(data)}]"
         elif seg_type == "voice":
             data = "[语音消息]"
-        elif seg_type not in {"text", "emoji"}:
+        elif seg_type != "text":
             logger.error("拒绝未知消息段 type=%s", seg_type)
             return
         text = self._text(data)
         if text:
-            await self._queue_outbound(receiver, "text", text)
+            if _IMAGE_DATA_URI.match(text):
+                await self._send_image_segment(receiver, text)
+            else:
+                await self._queue_outbound(receiver, "text", text)
+
+    async def _send_image_segment(self, receiver, data):
+        path, temporary = self._prepare_image(data)
+        deferred_cleanup = False
+        try:
+            await self._queue_outbound(receiver, "image", path)
+        except Exception as exc:
+            command_future = getattr(exc, "command_future", None)
+            if temporary and command_future is not None:
+                self._defer_temporary_cleanup(path, command_future)
+                deferred_cleanup = True
+            raise
+        finally:
+            if temporary and not deferred_cleanup:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    logger.warning("临时图片清理失败 path=%s", path, exc_info=True)
+
+    @staticmethod
+    def _textual_emoji(data):
+        if not isinstance(data, str):
+            raise ValueError("emoji segment 缺少有效图片数据")
+        text = data.strip()
+        if not text or len(text) > 64:
+            raise ValueError("emoji segment 包含无效或过长的媒体数据")
+        compact = "".join(text.split())
+        if len(compact) >= 16 and _BASE64_TEXT.fullmatch(compact):
+            raise ValueError("emoji segment 包含无效 base64 图片")
+        return text
 
     def _defer_temporary_cleanup(self, path, command_future):
         task = asyncio.create_task(self._cleanup_after_ui_command(path, command_future))
@@ -392,16 +429,26 @@ class MessageProcessor:
 
     def _prepare_image(self, data):
         if isinstance(data, dict):
-            data = data.get("base64") or data.get("path")
+            data = data.get("base64") or data.get("data") or data.get("path")
         if not isinstance(data, str) or not data:
             raise ValueError("image segment 缺少字符串 data")
+        data = data.strip()
         if os.path.isfile(data):
             if os.path.getsize(data) > MAX_MEDIA_BYTES:
                 raise ValueError("图片超过尺寸上限")
             with open(data, "rb") as stream:
                 self._validate_image(stream.read(16))
             return data, False
-        encoded = data.split(",", 1)[1] if data.startswith("data:image/") and "," in data else data
+        if data.lower().startswith("data:image/"):
+            match = _IMAGE_DATA_URI.match(data)
+            if not match:
+                raise ValueError("图片 data URI 必须使用 base64 编码")
+            encoded = data[match.end():]
+        else:
+            encoded = data
+        encoded = "".join(encoded.split())
+        if not encoded:
+            raise ValueError("base64 图片内容为空")
         if len(encoded) > ((MAX_MEDIA_BYTES + 2) // 3) * 4 + 8:
             raise ValueError("base64 图片超过尺寸上限")
         try:
