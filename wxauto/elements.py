@@ -190,6 +190,8 @@ class WeChatBase:
 class ChatWnd(WeChatBase):
     _MESSAGE_SNAPSHOT_ATTEMPTS = 3
     _MESSAGE_SNAPSHOT_RETRY_DELAY = 0.05
+    _SEND_CONFIRM_TIMEOUT = 1.5
+    _SEND_CONFIRM_INTERVAL = 0.02
 
     def __init__(self, who, language='cn', uia_name=None, hwnd=None):
         self.who = who
@@ -233,6 +235,37 @@ class ChatWnd(WeChatBase):
         self.HWND = FindWindow(name=self.uia_name, classname='ChatWnd')
         return ActivateWindow(self.HWND)
 
+    def _prepare_send(self):
+        """Establish the only safe precondition for global SendKeys."""
+        if not self._show():
+            raise RuntimeError(f'无法激活微信聊天窗口 --> {self.who}')
+        try:
+            self.editbox.SetFocus()
+        except Exception:
+            pass
+        if not self.editbox.HasKeyboardFocus:
+            # The window is known to be foreground, so this click cannot land
+            # in another application. Some WeChat builds ignore UIA SetFocus.
+            self.editbox.Click(simulateMove=False, waitTime=0)
+        if (win32gui.GetForegroundWindow() != self.HWND or
+                not self.editbox.HasKeyboardFocus):
+            raise RuntimeError(f'微信输入框无法获得焦点 --> {self.who}')
+
+    def _require_send_foreground(self):
+        if win32gui.GetForegroundWindow() != self.HWND:
+            raise RuntimeError(f'发送已取消：微信窗口失去前台焦点 --> {self.who}')
+
+    def _wait_input_changed(self, value_pattern, previous, description):
+        deadline = time.monotonic() + self._SEND_CONFIRM_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                if value_pattern.Value != previous:
+                    return
+            except Exception:
+                value_pattern = self.editbox.GetValuePattern()
+            time.sleep(self._SEND_CONFIRM_INTERVAL)
+        raise TimeoutError(f'{description}超时 --> {self.who}')
+
     def Close(self):
         if self._show():
             self.UiaAPI.SendKeys('{Alt}{F4}', waitTime=0)
@@ -267,9 +300,7 @@ class ChatWnd(WeChatBase):
             at (str|list, optional): 要@的人，可以是一个人或多个人，格式为str或list，例如："张三"或["张三", "李四"]
         """
         wxlog.debug(f"发送消息：{self.who} --> {msg}")
-        self._show()
-        if not self.editbox.HasKeyboardFocus:
-            self.editbox.Click(simulateMove=False, waitTime=0)
+        self._prepare_send()
 
         if at:
             if isinstance(at, str):
@@ -282,19 +313,13 @@ class ChatWnd(WeChatBase):
                     if msg and not msg.startswith('\n'):
                         msg = '\n' + msg
 
-        deadline = time.monotonic() + 10
         value_pattern = self.editbox.GetValuePattern()
-        while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f'发送消息超时 --> {self.who} - {msg}')
-            try:
-                SetClipboardText(msg)
-                self.editbox.SendKeys('{Ctrl}v', waitTime=0)
-                if value_pattern.Value:
-                    break
-            except Exception:
-                value_pattern = self.editbox.GetValuePattern()
-            time.sleep(0.02)
+        previous = value_pattern.Value
+        SetClipboardText(msg)
+        self._require_send_foreground()
+        self.editbox.SendKeys('{Ctrl}v', waitTime=0)
+        self._wait_input_changed(value_pattern, previous, '粘贴消息')
+        self._require_send_foreground()
         self.editbox.SendKeys('{Enter}', waitTime=0)
 
     def SendFiles(self, filepath):
@@ -325,21 +350,15 @@ class ChatWnd(WeChatBase):
             return False
         
         if filelist:
-            self._show()
+            self._prepare_send()
             self.editbox.SendKeys('{Ctrl}a', waitTime=0)
-            deadline = time.monotonic() + 10
             value_pattern = self.editbox.GetValuePattern()
-            while True:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f'发送文件超时 --> {filelist}')
-                try:
-                    SetClipboardFiles(filelist)
-                    self.editbox.SendKeys('{Ctrl}v', waitTime=0)
-                    if value_pattern.Value:
-                        break
-                except Exception:
-                    value_pattern = self.editbox.GetValuePattern()
-                time.sleep(0.02)
+            previous = value_pattern.Value
+            SetClipboardFiles(filelist)
+            self._require_send_foreground()
+            self.editbox.SendKeys('{Ctrl}v', waitTime=0)
+            self._wait_input_changed(value_pattern, previous, '粘贴文件')
+            self._require_send_foreground()
             self.editbox.SendKeys('{Enter}', waitTime=0)
             return True
         else:

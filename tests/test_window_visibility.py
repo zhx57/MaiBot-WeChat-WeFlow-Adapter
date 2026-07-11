@@ -69,6 +69,69 @@ class WindowVisibilityTest(unittest.TestCase):
         self.assertTrue(module.EnsureWindowVisibleNoActivate(456))
         gui.ShowWindow.assert_called_once_with(456, con.SW_SHOWNOACTIVATE)
 
+    def test_activation_joins_input_threads_and_confirms_foreground(self):
+        gui = types.ModuleType("win32gui")
+        gui.IsWindow = Mock(return_value=True)
+        gui.IsIconic = Mock(return_value=False)
+        gui.IsWindowVisible = Mock(return_value=True)
+        gui.GetForegroundWindow = Mock(side_effect=[999, 999, 123])
+        gui.BringWindowToTop = Mock()
+        gui.SetForegroundWindow = Mock()
+        con = types.ModuleType("win32con")
+        con.SW_RESTORE = 9
+        con.SW_SHOW = 5
+        module = _load_utils(gui, con)
+
+        user32 = types.SimpleNamespace(
+            GetWindowThreadProcessId=Mock(side_effect=lambda hwnd, _pid: {
+                123: 20, 999: 30}[hwnd]),
+            AttachThreadInput=Mock(return_value=1),
+            keybd_event=Mock(),
+        )
+        module.ctypes.windll = types.SimpleNamespace(
+            user32=user32,
+            kernel32=types.SimpleNamespace(GetCurrentThreadId=Mock(return_value=10)),
+        )
+
+        self.assertTrue(module.ActivateWindow(123))
+        self.assertEqual(user32.keybd_event.call_count, 2)
+        self.assertEqual(
+            [call.args for call in user32.AttachThreadInput.call_args_list[:3]],
+            [(10, 30, True), (10, 20, True), (20, 30, True)],
+        )
+        self.assertEqual(
+            [call.args for call in user32.AttachThreadInput.call_args_list[-3:]],
+            [(20, 30, False), (10, 20, False), (10, 30, False)],
+        )
+
+    def test_activation_failure_is_bounded_to_three_attempts(self):
+        gui = types.ModuleType("win32gui")
+        gui.IsWindow = Mock(return_value=True)
+        gui.IsIconic = Mock(return_value=False)
+        gui.IsWindowVisible = Mock(return_value=True)
+        gui.GetForegroundWindow = Mock(return_value=999)
+        gui.BringWindowToTop = Mock()
+        gui.SetForegroundWindow = Mock()
+        con = types.ModuleType("win32con")
+        con.SW_RESTORE = 9
+        con.SW_SHOW = 5
+        module = _load_utils(gui, con)
+        module.time.sleep = Mock()
+        user32 = types.SimpleNamespace(
+            GetWindowThreadProcessId=Mock(side_effect=lambda hwnd, _pid: {
+                123: 20, 999: 30}[hwnd]),
+            AttachThreadInput=Mock(return_value=1),
+            keybd_event=Mock(),
+        )
+        module.ctypes.windll = types.SimpleNamespace(
+            user32=user32,
+            kernel32=types.SimpleNamespace(GetCurrentThreadId=Mock(return_value=10)),
+        )
+
+        self.assertFalse(module.ActivateWindow(123))
+        self.assertEqual(gui.SetForegroundWindow.call_count, 3)
+        self.assertEqual(module.time.sleep.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

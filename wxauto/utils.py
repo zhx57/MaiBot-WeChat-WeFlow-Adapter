@@ -217,7 +217,13 @@ def EnsureWindowVisibleNoActivate(hwnd) -> bool:
 
 
 def ActivateWindow(hwnd) -> bool:
-    """Show and foreground a window, doing no work when it is already active."""
+    """Restore and reliably foreground a window before global keyboard input.
+
+    Windows may reject SetForegroundWindow when another process owns the
+    foreground lock.  Temporarily joining the caller, target and foreground
+    input queues, plus the conventional ALT unlock, gives the request the same
+    input context without changing the system-wide foreground timeout.
+    """
     if not hwnd or not win32gui.IsWindow(hwnd):
         return False
 
@@ -230,21 +236,45 @@ def ActivateWindow(hwnd) -> bool:
         return True
 
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    current_tid = kernel32.GetCurrentThreadId()
     target_tid = user32.GetWindowThreadProcessId(hwnd, None)
-    current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-    attached = current_tid != target_tid and bool(
-        user32.AttachThreadInput(current_tid, target_tid, True))
-    is_foreground = False
+    foreground = win32gui.GetForegroundWindow()
+    foreground_tid = (user32.GetWindowThreadProcessId(foreground, None)
+                      if foreground else 0)
+    thread_pairs = []
+    for source, target in (
+            (current_tid, foreground_tid),
+            (current_tid, target_tid),
+            (target_tid, foreground_tid)):
+        if source and target and source != target and (source, target) not in thread_pairs:
+            try:
+                if user32.AttachThreadInput(source, target, True):
+                    thread_pairs.append((source, target))
+            except Exception:
+                pass
     try:
-        win32gui.SetForegroundWindow(hwnd)
-        is_foreground = win32gui.GetForegroundWindow() == hwnd
-        if not is_foreground:
-            win32gui.BringWindowToTop(hwnd)
-            is_foreground = win32gui.GetForegroundWindow() == hwnd
+        for attempt in range(3):
+            try:
+                # A synthetic ALT press releases the foreground lock for this
+                # input queue. It does not type into the user's active window.
+                user32.keybd_event(0x12, 0, 0, 0)
+                user32.keybd_event(0x12, 0, 0x0002, 0)
+                win32gui.BringWindowToTop(hwnd)
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+            if attempt < 2:
+                time.sleep(0.05)
     finally:
-        if attached:
-            user32.AttachThreadInput(current_tid, target_tid, False)
-    return is_foreground
+        for source, target in reversed(thread_pairs):
+            try:
+                user32.AttachThreadInput(source, target, False)
+            except Exception:
+                pass
+    return False
 
 
 def FindWinEx(HWND, classname=None, name=None) -> list:
