@@ -8,10 +8,12 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -19,6 +21,9 @@ import time
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from maim_message import (
     BaseMessageInfo,
@@ -39,6 +44,8 @@ from config import (
     IMAGE_RECOGNITION_ENABLED,
     MAIBOT_API_URL,
     MAX_MEDIA_BYTES,
+    MEDIA_DOWNLOAD_MAX_REDIRECTS,
+    MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
     PLATFORM_ID,
     SEND_QUEUE_SIZE,
     WX_BOT_NICKNAME,
@@ -59,6 +66,25 @@ _IMAGE_DATA_URI = re.compile(
     re.IGNORECASE,
 )
 _BASE64_TEXT = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+_MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\((https?://[^\s)]+)(?:\s+[^)]*)?\)", re.IGNORECASE)
+_URL_START = re.compile(r"https?://", re.IGNORECASE)
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, validator, max_redirects):
+        super().__init__()
+        self.validator = validator
+        self.max_redirects = max_redirects
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirects = int(req.headers.get("X-WeMai-Redirects", "0")) + 1
+        if redirects > self.max_redirects:
+            raise ValueError("图片重定向次数过多")
+        self.validator(newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected.add_header("X-WeMai-Redirects", str(redirects))
+        return redirected
 
 
 class OutboundDeliveryError(RuntimeError):
@@ -333,7 +359,8 @@ class MessageProcessor:
         if seg_type in {"reply", "notify"}:
             return
         if seg_type == "image":
-            await self._send_image_segment(receiver, data)
+            for source in self._image_sources(data):
+                await self._send_image_segment(receiver, source)
             return
         if seg_type == "emoji":
             try:
@@ -359,7 +386,44 @@ class MessageProcessor:
             if _IMAGE_DATA_URI.match(text):
                 await self._send_image_segment(receiver, text)
             else:
-                await self._queue_outbound(receiver, "text", text)
+                image_urls = self._standalone_image_urls(text)
+                if image_urls:
+                    for url in image_urls:
+                        await self._send_image_segment(receiver, url)
+                else:
+                    await self._queue_outbound(receiver, "text", text)
+
+    @staticmethod
+    def _image_sources(data):
+        if isinstance(data, (list, tuple)):
+            if not data:
+                raise ValueError("image segment 的图片列表为空")
+            return list(data)
+        return [data]
+
+    @staticmethod
+    def _standalone_image_urls(text):
+        markdown_urls = _MARKDOWN_IMAGE.findall(text)
+        if markdown_urls:
+            remainder = _MARKDOWN_IMAGE.sub("", text)
+            if not remainder.strip(" \t\r\n,;，；"):
+                return markdown_urls
+            return []
+
+        starts = [match.start() for match in _URL_START.finditer(text)]
+        if not starts or text[:starts[0]].strip(" \t\r\n,;，；"):
+            return []
+        urls = []
+        for index, start in enumerate(starts):
+            end = starts[index + 1] if index + 1 < len(starts) else len(text)
+            candidate = text[start:end].strip(" \t\r\n,;，；")
+            if any(char.isspace() for char in candidate):
+                return []
+            parsed = urlsplit(candidate)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                return []
+            urls.append(candidate)
+        return urls
 
     async def _send_image_segment(self, receiver, data):
         path, temporary = self._prepare_image(data)
@@ -429,10 +493,15 @@ class MessageProcessor:
 
     def _prepare_image(self, data):
         if isinstance(data, dict):
-            data = data.get("base64") or data.get("data") or data.get("path")
+            sources = [data[key] for key in ("base64", "data", "path", "url") if data.get(key)]
+            if len(sources) != 1:
+                raise ValueError("image segment 必须且只能指定一种图片来源")
+            data = sources[0]
         if not isinstance(data, str) or not data:
             raise ValueError("image segment 缺少字符串 data")
         data = data.strip()
+        if data.lower().startswith(("http://", "https://")):
+            return self._download_image(data)
         if os.path.isfile(data):
             if os.path.getsize(data) > MAX_MEDIA_BYTES:
                 raise ValueError("图片超过尺寸上限")
@@ -462,6 +531,51 @@ class MessageProcessor:
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
         return path, True
+
+    def _download_image(self, url):
+        self._validate_public_url(url)
+        opener = build_opener(_SafeRedirectHandler(
+            self._validate_public_url, MEDIA_DOWNLOAD_MAX_REDIRECTS
+        ))
+        request = Request(url, headers={
+            "User-Agent": "WeMai/1.0",
+            "Accept": "image/png,image/jpeg,image/gif,image/webp;q=0.9,*/*;q=0.1",
+        })
+        try:
+            with opener.open(request, timeout=MEDIA_DOWNLOAD_TIMEOUT_SECONDS) as response:
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_MEDIA_BYTES:
+                    raise ValueError("远程图片超过尺寸上限")
+                raw = response.read(MAX_MEDIA_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError, socket.timeout) as exc:
+            raise ValueError("远程图片下载失败") from exc
+        if len(raw) > MAX_MEDIA_BYTES:
+            raise ValueError("远程图片超过尺寸上限")
+        suffix = self._validate_image(raw[:16])
+        fd, path = tempfile.mkstemp(prefix="wemai_", suffix=suffix)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+        return path, True
+
+    @staticmethod
+    def _validate_public_url(url):
+        if not isinstance(url, str) or len(url) > 8192:
+            raise ValueError("图片 URL 无效或过长")
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("图片 URL 仅支持 HTTP(S)")
+        if parsed.username or parsed.password:
+            raise ValueError("图片 URL 禁止包含用户凭据")
+        try:
+            addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise ValueError("图片 URL 域名解析失败") from exc
+        if not addresses:
+            raise ValueError("图片 URL 域名没有可用地址")
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if not ip.is_global:
+                raise ValueError("图片 URL 指向非公网地址")
 
     @staticmethod
     def _validate_image(header):

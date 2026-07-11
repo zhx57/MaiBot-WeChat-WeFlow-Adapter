@@ -89,6 +89,8 @@ def _bounded_int(name: str, default: int, maximum: int) -> int:
 
 
 MAX_MEDIA_BYTES = _bounded_int('MAX_MEDIA_BYTES', 10 * 1024 * 1024, 1024 * 1024 * 1024)
+MEDIA_DOWNLOAD_TIMEOUT_SECONDS = _bounded_int('MEDIA_DOWNLOAD_TIMEOUT_SECONDS', 15, 120)
+MEDIA_DOWNLOAD_MAX_REDIRECTS = _bounded_int('MEDIA_DOWNLOAD_MAX_REDIRECTS', 3, 10)
 SEND_QUEUE_SIZE = _bounded_int('SEND_QUEUE_SIZE', 100, 100000)
 UI_QUEUE_SIZE = _bounded_int('UI_QUEUE_SIZE', 100, 10000)
 ID_MAP_FILE = os.getenv('ID_MAP_FILE', 'wemai_id_map.json')

@@ -97,6 +97,75 @@ class MessageProcessorMediaTests(unittest.IsolatedAsyncioTestCase):
         }, "chat")
         self.assertEqual([("text", "before"), ("image", PNG), ("text", "after")], sent)
 
+    async def test_concatenated_image_urls_are_sent_separately(self):
+        urls = ["https://images.example/a.png", "https://images.example/b.png"]
+        paths = []
+
+        def download(url):
+            path, temporary = self.processor._prepare_image(PNG_BASE64)
+            self.assertTrue(temporary)
+            paths.append((url, path))
+            return path, True
+
+        sent = []
+
+        async def capture(_receiver, kind, path):
+            sent.append((kind, paths[-1][0]))
+
+        self.processor._download_image = download
+        self.processor._queue_outbound.side_effect = capture
+        await self.processor._process_segments(
+            {"type": "text", "data": "".join(urls)}, "chat"
+        )
+        self.assertEqual([("image", urls[0]), ("image", urls[1])], sent)
+        self.assertTrue(all(not os.path.exists(path) for _, path in paths))
+
+    async def test_markdown_images_are_sent_separately(self):
+        urls = ["https://images.example/a", "https://images.example/b"]
+        downloaded = []
+
+        def download(url):
+            downloaded.append(url)
+            return self.processor._prepare_image(PNG_BASE64)
+
+        self.processor._download_image = download
+        await self.processor._process_segments(
+            {"type": "text", "data": f"![a]({urls[0]})\n![b]({urls[1]})"}, "chat"
+        )
+        self.assertEqual(urls, downloaded)
+        self.assertEqual(2, self.processor._queue_outbound.await_count)
+
+    async def test_text_with_explanation_and_url_remains_text(self):
+        text = "参考图片：https://images.example/a.png"
+        await self.processor._process_segments({"type": "text", "data": text}, "chat")
+        self.processor._queue_outbound.assert_awaited_once_with("chat", "text", text)
+
+    async def test_image_url_list_is_sent_separately(self):
+        urls = ["https://images.example/a", "https://images.example/b"]
+        downloaded = []
+
+        def download(url):
+            downloaded.append(url)
+            return self.processor._prepare_image(PNG_BASE64)
+
+        self.processor._download_image = download
+        await self.processor._process_segments(
+            {"type": "image", "data": [{"url": url} for url in urls]}, "chat"
+        )
+        self.assertEqual(urls, downloaded)
+        self.assertEqual(2, self.processor._queue_outbound.await_count)
+
+    def test_private_image_url_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "非公网地址"):
+            self.processor._validate_public_url("http://127.0.0.1/image.png")
+
+    def test_ambiguous_image_source_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "只能指定一种"):
+            self.processor._prepare_image({
+                "base64": PNG_BASE64,
+                "url": "https://images.example/a.png",
+            })
+
     def test_prepare_image_accepts_wrapped_whitespace(self):
         path, temporary = self.processor._prepare_image({
             "data": f"data:image/png;base64,\n{PNG_BASE64}\n",
