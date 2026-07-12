@@ -437,15 +437,23 @@ class ChatWnd(WeChatBase):
             # Preserve the last known IDs.  Treating a transient empty UIA tree
             # as the new state would replay the whole visible history later.
             return []
+        known_ids = set(self.usedmsgid)
+        last_known_index = max(
+            (index for index, msgid in enumerate(msgids) if msgid in known_ids),
+            default=None,
+        )
+        # Scrolling upward exposes an unknown historical prefix. Only unseen
+        # items after the newest known item can be newly appended messages.
+        new_ids = set(msgids[last_known_index + 1:]) if last_known_index is not None else set()
         NewMsgItems = [
             item for item in MsgItems
             if item.ControlTypeName == 'ListItemControl'
-            and ''.join([str(part) for part in item.GetRuntimeId()]) not in self.usedmsgid
+            and ''.join([str(part) for part in item.GetRuntimeId()]) in new_ids
         ]
+        self.usedmsgid.extend(msgid for msgid in msgids if msgid not in known_ids)
         if not NewMsgItems:
             return []
         newmsgs = self._getmsgs(NewMsgItems, savepic, savefile, savevoice)
-        self.usedmsgid = msgids
         # if newmsgs[0].type == 'sys' and newmsgs[0].content == self._lang('查看更多消息'):
         #     newmsgs = newmsgs[1:]
         return newmsgs

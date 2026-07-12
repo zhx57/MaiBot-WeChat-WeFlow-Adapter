@@ -121,9 +121,40 @@ class GetListenMessageIsolationTest(unittest.TestCase):
             GetChildren=Mock(side_effect=[[], [message]]))
         chat._getmsgs = Mock(return_value=["new"])
 
-        self.assertEqual(chat.GetNewMessage(), ["new"])
+        # A completely disjoint snapshot can be caused by scrolling to history.
+        # Without an overlap anchor it must not be replayed as a new message.
+        self.assertEqual(chat.GetNewMessage(), [])
         visible.assert_called_once_with(456)
         self.assertEqual(chat.C_MsgList.GetChildren.call_count, 2)
+
+    def test_scrolling_up_does_not_replay_historical_messages(self):
+        module = _load_elements_module()
+
+        def item(runtime_id):
+            return SimpleNamespace(
+                ControlTypeName="ListItemControl",
+                GetRuntimeId=lambda: [runtime_id],
+            )
+
+        history = [item(0), item(1)]
+        known = [item(2), item(3)]
+        new_message = item(4)
+        chat = module.ChatWnd.__new__(module.ChatWnd)
+        chat.who = "Target"
+        chat.HWND = 789
+        chat.usedmsgid = ["2", "3"]
+        chat._baseline_pending = False
+        chat.C_MsgList = SimpleNamespace(GetChildren=Mock(side_effect=[
+            history + known,
+            known,
+            known + [new_message],
+        ]))
+        chat._getmsgs = Mock(return_value=["new"])
+
+        self.assertEqual(chat.GetNewMessage(savepic=True), [])
+        self.assertEqual(chat.GetNewMessage(savepic=True), [])
+        self.assertEqual(chat.GetNewMessage(savepic=True), ["new"])
+        chat._getmsgs.assert_called_once_with([new_message], True, False, False)
 
 
 if __name__ == "__main__":
