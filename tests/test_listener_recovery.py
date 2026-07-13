@@ -106,6 +106,41 @@ class ListenerRecoveryTest(unittest.TestCase):
         commands.get_nowait.assert_called_once_with()
         commands.task_done.assert_called_once_with()
 
+    def test_chat_type_detection_distinguishes_private_and_group_titles(self):
+        listener = self.make_listener()
+
+        def chat_with_title(*parts):
+            title = SimpleNamespace(GetChildren=Mock(return_value=[
+                SimpleNamespace(Name=part) for part in parts
+            ]))
+            return SimpleNamespace(
+                who=parts[0],
+                _show=Mock(return_value=True),
+                UiaAPI=SimpleNamespace(GetProgenyControl=Mock(return_value=title)),
+            )
+
+        private = chat_with_title("Alice")
+        group = chat_with_title("Project Group", " (42)")
+
+        self.assertEqual(listener._detect_chat_type(private), "private")
+        self.assertEqual(listener._detect_chat_type(group), "group")
+        private._show.assert_called_once_with()
+        group._show.assert_called_once_with()
+
+    def test_chat_type_detection_rejects_ambiguous_title_structure(self):
+        listener = self.make_listener()
+        title = SimpleNamespace(GetChildren=Mock(return_value=[
+            SimpleNamespace(Name="Alice"),
+            SimpleNamespace(Name="status"),
+        ]))
+        chat = SimpleNamespace(
+            who="Alice",
+            _show=Mock(return_value=True),
+            UiaAPI=SimpleNamespace(GetProgenyControl=Mock(return_value=title)),
+        )
+
+        self.assertIsNone(listener._detect_chat_type(chat))
+
     def test_started_command_timeout_is_bounded_and_not_retry_safe(self):
         commands = UICommandQueue()
         commands._queue.put = Mock(

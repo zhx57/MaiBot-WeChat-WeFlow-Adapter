@@ -469,14 +469,15 @@ class WeChatListener:
         return False
 
     def _detect_chat_type(self, chat):
-        """Probe group-only controls while the independent window is active."""
+        """Read the independent window title structure used by WeChat 3.9."""
         try:
             chat._show()
-            for label in ("聊天信息", "群成员", "查看更多群成员"):
-                if chat.UiaAPI.ButtonControl(Name=label).Exists(maxSearchSeconds=0.2):
-                    return "group"
-            # Group windows normally expose the member panel/button without a stable label.
-            if chat.UiaAPI.PaneControl(ClassName="ChatContactMenu").Exists(maxSearchSeconds=0.2):
+            title_parts = chat.UiaAPI.GetProgenyControl(11).GetChildren()
+            if len(title_parts) == 1:
+                return "private"
+            if (len(title_parts) == 2
+                    and re.fullmatch(r"\s*[（(]\d+[）)]\s*",
+                                     str(getattr(title_parts[-1], "Name", "")))):
                 return "group"
         except Exception as exc:
             logger.debug("聊天类型探测失败 chat=%s: %s", chat.who, exc)
