@@ -14,7 +14,7 @@ websockets==15.0.1
 # MaiBot通信相关
 # 新版麦麦(>=1.0)要求 maim_message>=0.6.2，旧版 0.3.x 用 socket.io 协议
 # 会和新版麦麦的纯 WebSocket 服务端不兼容（连接 404）。
-maim_message==0.7.5
+maim_message==0.6.8
 
 # 工具
 python-dotenv==1.1.1
