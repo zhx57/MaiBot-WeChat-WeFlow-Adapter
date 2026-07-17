@@ -20,7 +20,7 @@
 ## 环境要求
 
 - Python 3.9+
-- Windows + 微信桌面版 4.x
+- Windows + 微信桌面版 4.1.7.59（建议版本）
 - [WeFlow](https://github.com/Techuouo520/UserDataIsSafeFromUsers)（需开启 HTTP API 服务和主动推送）
 - [MaiBot](https://github.com/MaiM-with-u/MaiBot) >= 1.0.0（需 `maim_message >= 0.6.2`）
 
