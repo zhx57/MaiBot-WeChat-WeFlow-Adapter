@@ -1,20 +1,18 @@
 # WeMai 项目依赖
 
 # 微信自动化相关
-uiautomation==0.4.0
-Pillow==11.3.0
-pywin32==311; sys_platform == "win32"
-comtypes==1.4.11; sys_platform == "win32"
-psutil==7.0.0
-pyperclip==1.9.0
+wx4py>=0.2.1
+Pillow>=10.0.0
+pyperclip>=1.9.0
 
 # WebSocket 支持（maim_message 依赖）
-websockets==15.0.1
+websockets>=12.0
 
 # MaiBot通信相关
-# 新版麦麦(>=1.0)要求 maim_message>=0.6.2，旧版 0.3.x 用 socket.io 协议
-# 会和新版麦麦的纯 WebSocket 服务端不兼容（连接 404）。
+# 本项目严格使用 0.6.8 的 Legacy Router/MessageBase/Seg API。
+# 0.7.x 未经 Legacy API 兼容性验证，不自动升级。
 maim_message==0.6.8
 
 # 工具
-python-dotenv==1.1.1
+aiofiles>=23.0
+python-dotenv>=1.0.0

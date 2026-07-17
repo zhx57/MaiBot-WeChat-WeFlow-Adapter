@@ -46,7 +46,12 @@ def _parse_bool(value: Optional[str], default: bool = False) -> bool:
     """解析字符串为布尔值"""
     if not value:
         return default
-    return value.lower() in ('true', 'yes', '1', 't', 'y')
+    normalized = value.strip().lower()
+    if normalized in ('true', 'yes', '1', 't', 'y', 'on'):
+        return True
+    if normalized in ('false', 'no', '0', 'f', 'n', 'off'):
+        return False
+    raise ValueError(f"布尔配置值无效: {value!r}")
 
 # 要监听的聊天对象列表
 WX_TARGET_CHATS = _parse_list(os.getenv('WX_TARGET_CHATS'), [])
@@ -60,10 +65,21 @@ WX_EXCLUDED_CHATS = _parse_list(
     ["文件传输助手", "微信团队", "微信支付"]
 )
 
+# WeFlow HTTP API 配置。主动推送启用时 Token 为必填项，并在服务启动时校验。
+WEFLOW_API_URL = os.getenv('WEFLOW_API_URL', 'http://127.0.0.1:5031').strip().rstrip('/')
+WEFLOW_API_TOKEN = os.getenv('WEFLOW_API_TOKEN', '').strip()
+WEFLOW_PUSH_ENABLED = _parse_bool(os.getenv('WEFLOW_PUSH_ENABLED'), True)
+
 # MaiBot API 配置
 # 新版麦麦用 maim_message 库的纯 WebSocket 服务，默认端口 8000，路径 /ws。
 # 端口对应 bot_config.toml 里 [maim_message].ws_server_port（默认 8000）。
 MAIBOT_API_URL = os.getenv('MAIBOT_API_URL', 'ws://127.0.0.1:8000/ws')
+_maibot_data_dir = os.getenv('MAIBOT_DATA_DIR', '').strip()
+MAIBOT_DATA_DIR = (
+    os.path.abspath(os.path.expanduser(_maibot_data_dir))
+    if _maibot_data_dir
+    else ''
+)
 
 # 日志配置
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').strip().upper()
@@ -73,10 +89,12 @@ LOG_FORMAT = os.getenv('LOG_FORMAT', '%(asctime)s - %(levelname)s - %(message)s'
 LOG_DATE_FORMAT = os.getenv('LOG_DATE_FORMAT', '%Y-%m-%d %H:%M:%S')
 
 # 平台标识
-PLATFORM_ID = os.getenv('PLATFORM_ID', 'wxauto')
+PLATFORM_ID = os.getenv('PLATFORM_ID', 'wx4py')
 WX_BOT_NICKNAME = os.getenv('WX_BOT_NICKNAME', '').strip()
 IMAGE_AUTO_DOWNLOAD = _parse_bool(os.getenv('IMAGE_AUTO_DOWNLOAD'), True)
 IMAGE_RECOGNITION_ENABLED = _parse_bool(os.getenv('IMAGE_RECOGNITION_ENABLED'), True)
+
+
 def _bounded_int(name: str, default: int, maximum: int) -> int:
     raw = os.getenv(name, str(default))
     try:
@@ -88,11 +106,66 @@ def _bounded_int(name: str, default: int, maximum: int) -> int:
     return value
 
 
+def _positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必须是数字，当前值: {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} 必须大于 0，当前值: {value}")
+    return value
+
+
+def _nonnegative_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必须是数字，当前值: {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} 必须大于或等于 0，当前值: {value}")
+    return value
+
+
+# wx4py 连接与消息监听调度参数
+WX4PY_AUTO_CONNECT = _parse_bool(os.getenv('WX4PY_AUTO_CONNECT'), True)
+WX4PY_TICK = _positive_float('WX4PY_TICK', 0.05)
+WX4PY_BATCH_SIZE = _bounded_int('WX4PY_BATCH_SIZE', 8, 10000)
+WX4PY_TAIL_SIZE = _bounded_int('WX4PY_TAIL_SIZE', 8, 10000)
+WX4PY_UI_LOOKUP_TIMEOUT = _positive_float('WX4PY_UI_LOOKUP_TIMEOUT', 0.08)
+WX4PY_UI_POLL_INTERVAL = _positive_float('WX4PY_UI_POLL_INTERVAL', 0.05)
+WX4PY_SEARCH_TIMEOUT = _positive_float('WX4PY_SEARCH_TIMEOUT', 4.0)
+WX4PY_SUBWINDOW_TIMEOUT = _positive_float('WX4PY_SUBWINDOW_TIMEOUT', 8.0)
+WX4PY_WINDOW_CHECK_INTERVAL = _positive_float(
+    'WX4PY_WINDOW_CHECK_INTERVAL', 5.0
+)
+
+# 0 表示等待所有初始目标处理完成，不按累计耗时误杀 UI worker。
+UI_WORKER_STARTUP_TIMEOUT_SECONDS = _nonnegative_float(
+    'UI_WORKER_STARTUP_TIMEOUT_SECONDS', 0.0
+)
+
+
+IMAGE_SAVE_DIR = os.path.abspath(os.path.expanduser(
+    os.getenv('IMAGE_SAVE_DIR', os.path.join(os.getcwd(), 'wxauto文件'))
+))
+IMAGE_SAVE_TIMEOUT_SECONDS = _bounded_int('IMAGE_SAVE_TIMEOUT_SECONDS', 10, 120)
 MAX_MEDIA_BYTES = _bounded_int('MAX_MEDIA_BYTES', 10 * 1024 * 1024, 1024 * 1024 * 1024)
 MEDIA_DOWNLOAD_TIMEOUT_SECONDS = _bounded_int('MEDIA_DOWNLOAD_TIMEOUT_SECONDS', 15, 120)
 MEDIA_DOWNLOAD_MAX_REDIRECTS = _bounded_int('MEDIA_DOWNLOAD_MAX_REDIRECTS', 3, 10)
 SEND_QUEUE_SIZE = _bounded_int('SEND_QUEUE_SIZE', 100, 100000)
 UI_QUEUE_SIZE = _bounded_int('UI_QUEUE_SIZE', 100, 10000)
+UI_WORKER_IDLE_TIMEOUT_SECONDS = _positive_float(
+    'UI_WORKER_IDLE_TIMEOUT_SECONDS', 30.0
+)
+UI_WORKER_BUSY_TIMEOUT_SECONDS = max(
+    _positive_float('UI_WORKER_BUSY_TIMEOUT_SECONDS', 60.0),
+    IMAGE_SAVE_TIMEOUT_SECONDS + 15.0,
+)
+UI_WORKER_AUTO_RESTART = _parse_bool(
+    os.getenv('UI_WORKER_AUTO_RESTART'), True
+)
 ID_MAP_FILE = os.getenv('ID_MAP_FILE', 'wemai_id_map.json')
 LOG_MAX_BYTES = _bounded_int('LOG_MAX_BYTES', 10 * 1024 * 1024, 10 * 1024 * 1024 * 1024)
 LOG_BACKUP_COUNT = _bounded_int('LOG_BACKUP_COUNT', 5, 100)
@@ -101,6 +174,11 @@ EXIT_LOG_BACKUP_COUNT = _bounded_int('EXIT_LOG_BACKUP_COUNT', 3, 100)
 
 if LOG_LEVEL not in {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}:
     raise ValueError(f"无效 LOG_LEVEL: {LOG_LEVEL!r}")
+if UI_WORKER_BUSY_TIMEOUT_SECONDS < UI_WORKER_IDLE_TIMEOUT_SECONDS:
+    raise ValueError(
+        "UI_WORKER_BUSY_TIMEOUT_SECONDS 不能小于 "
+        "UI_WORKER_IDLE_TIMEOUT_SECONDS"
+    )
 
 # 配置信息打印
 def print_config_info():
@@ -110,9 +188,44 @@ def print_config_info():
     logger.info(f"\u5fae信监听目标: {WX_TARGET_CHATS}")
     logger.info(f"\u76d1听所有聊天: {WX_LISTEN_ALL_IF_EMPTY}")
     logger.info(f"\u6392除的聊天: {WX_EXCLUDED_CHATS}")
+    logger.info(
+        "WeFlow: push_enabled=%s api_url=%s token_configured=%s",
+        WEFLOW_PUSH_ENABLED,
+        WEFLOW_API_URL,
+        bool(WEFLOW_API_TOKEN),
+    )
     logger.info(f"MaiBot API URL: {MAIBOT_API_URL}")
+    logger.info(f"MaiBot 数据目录: {MAIBOT_DATA_DIR or '<未配置>'}")
     logger.info(f"\u65e5志级别: {LOG_LEVEL}")
     logger.info(f"\u5e73台标识: {PLATFORM_ID}")
+    logger.info(
+        "wx4py: auto_connect=%s tick=%s batch_size=%s tail_size=%s "
+        "lookup_timeout=%ss poll_interval=%ss search_timeout=%ss "
+        "subwindow_timeout=%ss window_check_interval=%ss ui_startup_timeout=%ss",
+        WX4PY_AUTO_CONNECT,
+        WX4PY_TICK,
+        WX4PY_BATCH_SIZE,
+        WX4PY_TAIL_SIZE,
+        WX4PY_UI_LOOKUP_TIMEOUT,
+        WX4PY_UI_POLL_INTERVAL,
+        WX4PY_SEARCH_TIMEOUT,
+        WX4PY_SUBWINDOW_TIMEOUT,
+        WX4PY_WINDOW_CHECK_INTERVAL,
+        UI_WORKER_STARTUP_TIMEOUT_SECONDS,
+    )
+    logger.info(
+        "UI worker watchdog: idle=%ss busy=%ss auto_restart=%s",
+        UI_WORKER_IDLE_TIMEOUT_SECONDS,
+        UI_WORKER_BUSY_TIMEOUT_SECONDS,
+        UI_WORKER_AUTO_RESTART,
+    )
+    logger.info(
+        "图片处理: auto_download=%s recognition=%s save_dir=%s timeout=%ss",
+        IMAGE_AUTO_DOWNLOAD,
+        IMAGE_RECOGNITION_ENABLED,
+        IMAGE_SAVE_DIR,
+        IMAGE_SAVE_TIMEOUT_SECONDS,
+    )
     logger.info("==========================\n")
 
 # 日志只由 main.configure_logging() 集中初始化。

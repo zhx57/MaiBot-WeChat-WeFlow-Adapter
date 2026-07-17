@@ -19,6 +19,10 @@ class NormalizeChatNameTest(unittest.TestCase):
     def test_nfc_and_control_characters(self):
         self.assertEqual(normalize_chat_name("Cafe\u0301\x00"), "Café")
 
+    def test_preserves_semantic_format_characters_and_trims_outer_space(self):
+        self.assertEqual(normalize_chat_name("  正常群名\n"), "正常群名")
+        self.assertEqual(normalize_chat_name("👩\u200d💻讨论组"), "👩\u200d💻讨论组")
+
 
 if __name__ == "__main__":
     unittest.main()

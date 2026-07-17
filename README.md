@@ -1,7 +1,7 @@
 # WeMai - 微信分麦
 
 <div align="center">
-  <img src="https://img.shields.io/badge/Python-3.8+-blue.svg" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/Python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
   <img src="https://img.shields.io/badge/Platform-Windows-lightgrey.svg" alt="Platform Windows">
 </div>
@@ -39,14 +39,9 @@
 
 ### 环境要求
 
-- Python 3.8+
-- 微信桌面版（3.9.11.17）
+- Python 3.9+
+- 微信桌面版 4.x（已验证 4.1.7.59、4.1.8.29）
 - MaiBot（>=1.0.0）
-
-### 微信关闭自动更新方法
-
-- 参考https://github.com/Skyler1n/WeChat3.9-32bit-Compatibility-Launcher
-- 注意一定要下32位版本的，该链接给的是3.9.12版本，亲测麦麦可用
 
 ### 安装步骤
 
@@ -97,12 +92,21 @@ optional arguments:
 graph TD
     A[main.py] --> B[wx_Listener.py]
     B -->|监听微信消息| F[微信]
-    B --> E[wx_Processer.py]
+    B --> E[wx_Processor.py]
     E -->|WebSocket 双向通信| G[MaiBot]
     E -->|Router 接收回复| F
 ```
 
-新版麦麦用 `maim_message` 的纯 WebSocket 做双向通信，`wx_Processer` 里的 Router 同时处理入站（微信→麦麦）和出站（麦麦→微信），**无需 Redis 队列中转**，架构更简单。
+新版麦麦用 `maim_message` 的纯 WebSocket 做双向通信，`wx_Processor` 里的 Router 同时处理入站（微信→麦麦）和出站（麦麦→微信），**无需 Redis 队列中转**。
+
+收到微信 4.0 图片消息时，监听器会在对应独立聊天窗口中自动打开预览，
+把原图保存到 `IMAGE_SAVE_DIR`（默认项目目录下的 `wxauto文件`），再编码成
+MaiBot 的 `image` 消息段。可通过 `IMAGE_AUTO_DOWNLOAD=false` 关闭自动保存，
+或通过 `IMAGE_RECOGNITION_ENABLED=false` 关闭图片段转换。
+
+UIAutomation/COM 调用若停止返回，主线程会按心跳时限打印卡住线程的堆栈，
+写入 `wemai_exit.log`，并默认重新执行当前 WeMai 进程。设置
+`UI_WORKER_AUTO_RESTART=false` 可只记录诊断并退出，不自动重启。
 
 ## ⚙️ 配置说明
 
@@ -111,19 +115,43 @@ WeMai使用`.env`文件进行配置，主要配置项包括：
 | 配置项 | 说明 | 默认值 |
 |-------|------|-------|
 | WX_TARGET_CHATS | 要监听的聊天对象列表 | 空（由命令行参数决定） |
-| WX_LISTEN_ALL_IF_EMPTY | 是否监听所有聊天 | false |
+| WX_LISTEN_ALL_IF_EMPTY | 兼容配置；微信 4.x 仍要求显式列出目标，空目标且为 true 时启动失败 | false |
 | WX_EXCLUDED_CHATS | 排除的聊天对象 | 文件传输助手,微信团队,微信支付 |
+| WX4PY_AUTO_CONNECT | 创建 wx4py 客户端时自动连接 | true |
+| WX4PY_TICK | 监听轮询间隔（秒） | 0.05 |
+| WX4PY_BATCH_SIZE | 兼容参数；到期聊天始终全部扫描 | 8 |
+| WX4PY_TAIL_SIZE | 图片重试时检查的可见尾部行数；不截断新增消息 | 8 |
+| WX4PY_UI_LOOKUP_TIMEOUT | 单次 UIA 控件探测最长等待（秒） | 0.08 |
+| WX4PY_UI_POLL_INTERVAL | 微信界面状态轮询间隔（秒） | 0.05 |
+| WX4PY_SEARCH_TIMEOUT | 搜索结果最长等待（秒） | 4.0 |
+| WX4PY_SUBWINDOW_TIMEOUT | 双击后等待独立窗口就绪（秒） | 8.0 |
+| UI_WORKER_STARTUP_TIMEOUT_SECONDS | 全部初始目标的累计启动时限；0 表示关闭 | 0 |
+| UI_WORKER_IDLE_TIMEOUT_SECONDS | 空闲轮询无心跳的卡死判定时限（秒） | 30 |
+| UI_WORKER_BUSY_TIMEOUT_SECONDS | 发送、恢复或图片保存无心跳的卡死判定时限（秒） | 60 |
+| UI_WORKER_AUTO_RESTART | 确认 UIA/COM 卡死后自动重启 WeMai 进程 | true |
 | MAIBOT_API_URL | MaiBot WebSocket地址 | ws://127.0.0.1:8000/ws |
-| PLATFORM_ID | 平台标识 | wxauto |
+| PLATFORM_ID | 平台标识 | wx4py |
 | WX_BOT_NICKNAME | 机器人自己的微信昵称（可选，用于排除自身） | 空 |
+
+微信 4.0.5 及以上版本使用 Qt Quick，UIAutomation 不能稳定读取聊天头部的
+群成员控件。建议在 `WX_TARGET_CHATS` 中显式填写聊天类型，尤其是已经出现在
+左侧会话列表、启动时不一定需要搜索的私聊：
+
+```dotenv
+WX_TARGET_CHATS=[{"name":"项目群","type":"group"},{"name":"张总","type":"private"}]
+```
+
+显式配置始终优先。未填写 `type` 时，监听器会依次使用微信搜索结果的“群聊”或
+“联系人”分类、窗口与消息结构进行推断；仍无法判断时按 `group` 处理。启动日志会
+输出每个目标最终使用的 `chat_type` 和判断来源 `type_source`，可据此修正配置。
 
 ## 🔌 适配新版麦麦（重要）
 
 新版麦麦（MaiBot >= 1.0.0）的消息服务改用 `maim_message` 库的**纯 WebSocket**，旧版 WeMai 用的 `maim_message 0.3.x` 是 socket.io 协议，连不上会报 `404 Not Found`。适配需要做三件事：
 
-### 1. 升级 maim_message 库
+### 1. 安装固定版本的 maim_message
 
-WeMai 的 `requirements.txt` 已改为 `maim_message>=0.6.2`，重新安装依赖即可：
+WeMai 使用 `maim_message==0.6.8` 的 Legacy API；重新安装依赖即可：
 
 ```bash
 pip install -r requirements.txt --upgrade
@@ -145,16 +173,16 @@ MAIBOT_API_URL=ws://192.168.x.x:8000/ws
 
 ### 3. 配置麦麦主配置的 platforms
 
-在麦麦的 `config/bot_config.toml` 的 `[bot]` 段，把微信平台加进 `platforms`，否则麦麦收到消息后会报「平台 wxauto 未配置机器人账号」而拒绝回复：
+在麦麦的 `config/bot_config.toml` 的 `[bot]` 段，把微信平台加进 `platforms`，否则麦麦会因为未配置 wx4py 机器人账号而拒绝回复：
 
 ```toml
 [bot]
-platform = "wxauto"
-platforms = ["wxauto:你的微信昵称或wxid"]
+platform = "wx4py"
+platforms = ["wx4py:你的微信昵称或wxid"]
 nickname = "你的机器人微信昵称"
 ```
 
-> `platforms` 的格式是 `平台名:账号标识`。WeMai 用 `wxauto` 作为平台名（对应 `.env` 里的 `PLATFORM_ID`），冒号后面可以填机器人微信昵称。
+> `platforms` 的格式是 `平台名:账号标识`。WeMai 默认用 `wx4py` 作为平台名（对应 `.env` 里的 `PLATFORM_ID`），冒号后面可以填机器人微信昵称。
 
 ### 验证连接
 
@@ -169,7 +197,7 @@ nickname = "你的机器人微信昵称"
 2. **消息流向**
 
    - **微信→MaiBot**：监听微信消息，转换格式后发送到MaiBot API
-   - **MaiBot→微信**：接收MaiBot响应，通过Redis队列转发到微信
+   - **MaiBot→微信**：通过 WebSocket 接收 MaiBot 响应并转发到微信
 
 3. **自动过滤**
 
@@ -194,6 +222,6 @@ nickname = "你的机器人微信昵称"
 ## 🙏 致谢
 
 - [MaiBot](https://github.com/MaiM-with-u/MaiBot) - 提供API接口支持
-- [wxauto](https://github.com/cluic/wxauto) - 提供微信自动化支持
+- [wx4py](https://github.com/claw-codes/wx4py) - 提供微信 4.x 自动化支持
 - [wepush](https://github.com/friend-nicen/wepush) - 提供框架设计基础及灵感
 - 所有贡献者和使用者
