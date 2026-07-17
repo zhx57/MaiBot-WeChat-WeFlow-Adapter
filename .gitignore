@@ -26,6 +26,14 @@ var/
 
 # 其它
 wxauto文件/
+.pytest_cache/
+
+# 参考源码（不应上传）
+wx4py_ref/
+wxauto40_ref/
+
+# 旧文件
+wx_Processer.py
 
 # 虚拟环境
 venv/
