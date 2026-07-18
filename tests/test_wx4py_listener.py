@@ -1236,6 +1236,15 @@ class Wx4pyListenerTest(unittest.TestCase):
         self.module_patch = patch.dict(sys.modules, {"wx4py": module})
         self.module_patch.start()
 
+        # 现有测试覆盖全量打开窗口路径；patch 新配置以保持原行为
+        self.config_patches = [
+            patch("wx_Listener.WX_OPEN_WINDOWS_ON_DEMAND", False),
+            patch("wx_Listener.WX_BLACKLIST_MODE", False),
+            patch("wx_Listener.WX_EXCLUDED_CHATS", []),
+        ]
+        for item in self.config_patches:
+            item.start()
+
         self.main_root = None
         self.session_items = {}
         self.session_hwnds = {}
@@ -1276,6 +1285,8 @@ class Wx4pyListenerTest(unittest.TestCase):
 
     def tearDown(self):
         for item in reversed(self.helper_patches):
+            item.stop()
+        for item in reversed(self.config_patches):
             item.stop()
         self.module_patch.stop()
 

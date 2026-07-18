@@ -20,6 +20,8 @@ from config import (
     MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
     WEFLOW_API_TOKEN,
     WEFLOW_API_URL,
+    WX_BLACKLIST_MODE,
+    WX_EXCLUDED_CHATS,
     WX_TARGET_CHATS,
 )
 from wx_Listener import _InboundEvent
@@ -133,6 +135,10 @@ class WeFlowListener:
         self._targets = self._normalize_targets(
             WX_TARGET_CHATS if target_chats is None else target_chats
         )
+        self._excluded_keys = {
+            normalize_chat_name(name) for name in WX_EXCLUDED_CHATS if name.strip()
+        }
+        self._blacklist_mode = WX_BLACKLIST_MODE
         self._seen = set()
         self._seen_order = deque()
         self._response = None
@@ -526,6 +532,23 @@ class WeFlowListener:
             normalize_chat_name(session_id),
             normalize_chat_name(display_name),
         } - {""}
+        # 黑名单优先：命中黑名单一律丢弃
+        if candidate_keys & self._excluded_keys:
+            logger.debug(
+                "黑名单过滤丢弃消息 chat=%s session_id=%s",
+                display_name,
+                session_id,
+            )
+            return None
+        # 黑名单模式：接受除黑名单外的所有聊天
+        if self._blacklist_mode:
+            name = display_name or session_id
+            return {
+                "name": name,
+                "key": normalize_chat_name(name),
+                "type": None,
+            }
+        # 白名单模式：仅接受 WX_TARGET_CHATS 中的聊天
         for target in self._targets:
             if target["key"] in candidate_keys and target["type"] in {
                 None,

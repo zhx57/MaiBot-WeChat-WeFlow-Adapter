@@ -59,16 +59,27 @@ WX_TARGET_CHATS = _parse_list(os.getenv('WX_TARGET_CHATS'), [])
 # 是否在未指定目标聊天时监听所有聊天
 WX_LISTEN_ALL_IF_EMPTY = _parse_bool(os.getenv('WX_LISTEN_ALL_IF_EMPTY'), False)
 
-# 排除的聊天对象
+# 排除的聊天对象（黑名单）
 WX_EXCLUDED_CHATS = _parse_list(
-    os.getenv('WX_EXCLUDED_CHATS'), 
+    os.getenv('WX_EXCLUDED_CHATS'),
     ["文件传输助手", "微信团队", "微信支付"]
 )
+
+# 黑名单模式：启用后忽略 WX_TARGET_CHATS 白名单，监听除黑名单外的所有聊天。
+# 仅在 WeFlow 推送启用时生效（UI 路径无法枚举全部聊天）。
+WX_BLACKLIST_MODE = _parse_bool(os.getenv('WX_BLACKLIST_MODE'), False)
 
 # WeFlow HTTP API 配置。主动推送启用时 Token 为必填项，并在服务启动时校验。
 WEFLOW_API_URL = os.getenv('WEFLOW_API_URL', 'http://127.0.0.1:5031').strip().rstrip('/')
 WEFLOW_API_TOKEN = os.getenv('WEFLOW_API_TOKEN', '').strip()
 WEFLOW_PUSH_ENABLED = _parse_bool(os.getenv('WEFLOW_PUSH_ENABLED'), True)
+
+# 按需打开窗口：启用后不在启动时一次性打开全部目标窗口，
+# 仅在发送消息时按需打开，打开后保持检测。
+# 默认跟随 WEFLOW_PUSH_ENABLED：WeFlow 接收时按需打开，UI 接收时仍全量打开。
+WX_OPEN_WINDOWS_ON_DEMAND = _parse_bool(
+    os.getenv('WX_OPEN_WINDOWS_ON_DEMAND'), WEFLOW_PUSH_ENABLED
+)
 
 # MaiBot API 配置
 # 新版麦麦用 maim_message 库的纯 WebSocket 服务，默认端口 8000，路径 /ws。
@@ -188,6 +199,8 @@ def print_config_info():
     logger.info(f"\u5fae信监听目标: {WX_TARGET_CHATS}")
     logger.info(f"\u76d1听所有聊天: {WX_LISTEN_ALL_IF_EMPTY}")
     logger.info(f"\u6392除的聊天: {WX_EXCLUDED_CHATS}")
+    logger.info(f"\u9ed1名单模式: {WX_BLACKLIST_MODE}")
+    logger.info(f"\u6309需打开窗口: {WX_OPEN_WINDOWS_ON_DEMAND}")
     logger.info(
         "WeFlow: push_enabled=%s api_url=%s token_configured=%s",
         WEFLOW_PUSH_ENABLED,

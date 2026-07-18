@@ -36,8 +36,11 @@ from config import (
     WX4PY_UI_LOOKUP_TIMEOUT,
     WX4PY_UI_POLL_INTERVAL,
     WX4PY_WINDOW_CHECK_INTERVAL,
+    WX_BLACKLIST_MODE,
     WX_BOT_NICKNAME,
+    WX_EXCLUDED_CHATS,
     WX_LISTEN_ALL_IF_EMPTY,
+    WX_OPEN_WINDOWS_ON_DEMAND,
     WX_TARGET_CHATS,
 )
 
@@ -3651,6 +3654,11 @@ class WeChatListener:
         self.target_specs = self._normalize_targets(target_chats)
         self.target_names = [item["name"] for item in self.target_specs]
         self.listening_target_names = []
+        self._excluded_keys = {
+            normalize_chat_name(name) for name in WX_EXCLUDED_CHATS if name.strip()
+        }
+        self._blacklist_mode = WX_BLACKLIST_MODE
+        self._open_on_demand = WX_OPEN_WINDOWS_ON_DEMAND
         self._configured_chat_types = {
             normalize_chat_name(item["name"]): item["type"]
             for item in self.target_specs
@@ -3891,6 +3899,25 @@ class WeChatListener:
         if self.callback is None:
             logger.info("微信到 MaiBot 方向已禁用；仍将打开并监控目标独立窗口")
 
+        # 按需打开模式：不主动打开窗口，仅准备发送通道；窗口在发送时按需打开，
+        # 打开后由 _monitor_session_windows 持续检测。
+        if self._open_on_demand:
+            self.listening_target_names = []
+            self._failed_target_names = []
+            self.processor = _ListenerStatus(self)
+            blacklisted = [
+                name for name in self.target_names
+                if normalize_chat_name(name) in self._excluded_keys
+            ]
+            logger.info(
+                "按需打开窗口模式已启动；窗口将在发送消息时按需打开并保持检测 "
+                "targets=%s excluded=%s",
+                self.target_names,
+                blacklisted,
+            )
+            self._touch_heartbeat()
+            return self.processor
+
         if not self.target_names:
             if WX_LISTEN_ALL_IF_EMPTY:
                 self.running = False
@@ -3903,10 +3930,27 @@ class WeChatListener:
             self._touch_heartbeat()
             return None
 
+        # 过滤黑名单目标
+        effective_target_names = [
+            name for name in self.target_names
+            if normalize_chat_name(name) not in self._excluded_keys
+        ]
+        blacklisted = [
+            name for name in self.target_names
+            if normalize_chat_name(name) in self._excluded_keys
+        ]
+        if blacklisted:
+            logger.info("黑名单过滤已排除以下目标: %s", blacklisted)
+        if not effective_target_names:
+            logger.info("全部目标均被黑名单排除；当前仅处理 MaiBot 到微信的消息")
+            self._touch_heartbeat()
+            return None
+
         untyped_targets = [
             item["name"]
             for item in self.target_specs
             if item.get("type") not in {"private", "group"}
+            and normalize_chat_name(item["name"]) not in self._excluded_keys
         ]
         if untyped_targets:
             logger.warning(
@@ -3921,9 +3965,9 @@ class WeChatListener:
         failures = []
         self.listening_target_names = []
         self._failed_target_names = []
-        total_targets = len(self.target_names)
+        total_targets = len(effective_target_names)
         cancelled = False
-        for index, target in enumerate(self.target_names, 1):
+        for index, target in enumerate(effective_target_names, 1):
             try:
                 self._raise_if_stopping()
             except _UIOperationCancelled:
@@ -5267,6 +5311,9 @@ class WeChatListener:
         sessions = []
         session_ids = set()
         for name in self.listening_target_names:
+            # 防御性过滤：黑名单中的目标不轮询接收消息
+            if normalize_chat_name(name) in self._excluded_keys:
+                continue
             session = self._sessions.get(normalize_chat_name(name))
             if (
                 session is None

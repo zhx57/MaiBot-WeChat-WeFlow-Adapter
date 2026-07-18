@@ -83,18 +83,29 @@ nickname = "你的机器人微信昵称"
 
 | 配置项 | 说明 | 默认值 |
 |-------|------|-------|
-| WX_TARGET_CHATS | 监听的聊天对象 | 空（必填） |
-| WX_EXCLUDED_CHATS | 排除的聊天对象 | 文件传输助手,微信团队,微信支付 |
+| WX_TARGET_CHATS | 监听的聊天对象（白名单） | 空 |
+| WX_EXCLUDED_CHATS | 排除的聊天对象（黑名单） | 文件传输助手,微信团队,微信支付 |
+| WX_BLACKLIST_MODE | 黑名单模式：监听除黑名单外所有聊天 | false |
+| WX_OPEN_WINDOWS_ON_DEMAND | 按需打开窗口，不一次性全开 | 跟随 WEFLOW_PUSH_ENABLED |
 | WX_BOT_NICKNAME | 机器人自己的微信昵称 | 空 |
 
-`WX_TARGET_CHATS` 支持两种格式：
+项目支持两种过滤模式：
+
+**白名单模式**（默认）：仅监听 `WX_TARGET_CHATS` 中列出的聊天，`WX_EXCLUDED_CHATS` 可从中排除。
+
+**黑名单模式**（`WX_BLACKLIST_MODE=true`）：忽略 `WX_TARGET_CHATS`，监听除 `WX_EXCLUDED_CHATS` 外的所有聊天。仅在 WeFlow 推送启用时生效。
 
 ```dotenv
-# 简单格式
+# 白名单模式
 WX_TARGET_CHATS=项目群,张总
+WX_EXCLUDED_CHATS=文件传输助手
 
 # 带类型（推荐，避免私聊被误识别为群聊）
 WX_TARGET_CHATS=[{"name":"项目群","type":"group"},{"name":"张总","type":"private"}]
+
+# 黑名单模式（监听所有人，排除指定聊天）
+WX_BLACKLIST_MODE=true
+WX_EXCLUDED_CHATS=文件传输助手,微信团队,微信支付
 ```
 
 ### 窗口与搜索
