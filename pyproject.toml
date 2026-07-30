@@ -1,0 +1,133 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wemai"
+version = "0.4.0"
+description = "WeFlow、MaiBot 与微信独立窗口收发的一体化 WeMai 桥接服务。"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "zhx57" },
+]
+keywords = ["maibot", "wechat", "weflow", "adapter"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+]
+dependencies = [
+    "wx4py==0.2.1",
+    "Pillow>=10.0.0",
+    "pyperclip>=1.9.0",
+    "websockets>=12.0",
+    "maim_message==0.6.8",
+    "aiofiles>=23.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+wemai = "main:cli_main"
+
+[project.urls]
+Homepage = "https://docs.mai-mai.org/"
+
+[tool.setuptools]
+py-modules = [
+    "chat_name_utils",
+    "bootstrap",
+    "config",
+    "dependency_check",
+    "main",
+    "outgoing_registry",
+    "optional_host_manager",
+    "weflow_listener",
+    "wx_Listener",
+    "wx_Processor",
+    "wx_exceptions",
+    "voice_host_backend",
+    "audio_segments",
+    "config_webui",
+    "wemai_supervisor",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+filterwarnings = [
+    "error",
+    # Tests intentionally exercise the no-deps fallback path on non-Windows.
+    "ignore::DeprecationWarning:wx_Listener",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["."]
+omit = [
+    "tests/*",
+    "main.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = [
+    "wx4py_ref",
+    "wxauto40_ref",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",  # line length (we keep at 100 but tolerate long strings)
+    "B008",  # function call in default argument (used a lot for config)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "B011"]
+"wx_Listener.py" = ["E402", "B008", "B904"]
+"wx_Processor.py" = ["E402", "B008"]
+"weflow_listener.py" = ["E402", "B008"]

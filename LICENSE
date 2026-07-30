@@ -1,0 +1,27 @@
+WeMai Learning and Non-Commercial License 1.0
+
+Copyright (c) 2025-2026 WeMai Contributors
+
+Permission is granted to use, copy, modify, and redistribute the WeMai-specific
+code and documentation for personal learning, education, testing, and
+non-commercial research, provided that this notice and the project attribution
+are retained.
+
+Commercial use is prohibited. This includes selling the software, charging for
+access to it, incorporating it into a paid product or service, operating it for
+commercial messaging or customer service, or using it primarily to generate
+commercial revenue, unless separate written permission is obtained from the
+applicable WeMai copyright holders.
+
+WeMai contains or depends on third-party software. This license applies only to
+the WeMai-specific additions and portions that the WeMai copyright holders are
+entitled to license. Third-party code, binaries, and derived portions remain
+subject to their respective licenses. Nothing in this license limits rights
+already granted by a third-party license. See THIRD_PARTY_NOTICES.md.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF THE SOFTWARE.

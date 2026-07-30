@@ -1,0 +1,9 @@
+# WeMai 核心消息链路
+wx4py==0.2.1
+Pillow>=10.0.0
+pyperclip>=1.9.0
+websockets>=12.0
+maim_message==0.6.8
+aiofiles>=23.0
+python-dotenv>=1.0.0
+
