@@ -30,8 +30,8 @@ from config import (
     MAX_MEDIA_BYTES,
     UI_QUEUE_SIZE,
     UI_WORKER_IDLE_TIMEOUT_SECONDS,
-    WEMAI_BOT_NICKNAME,
     WEMAI_AUTO_DISMISS_UPDATE,
+    WEMAI_BOT_NICKNAME,
     WEMAI_SEARCH_TIMEOUT,
     WEMAI_SUBWINDOW_TIMEOUT,
     WEMAI_SUBWINDOW_TITLE_REFRESHES,
@@ -179,10 +179,10 @@ _UPDATE_DIALOG_DISMISS_BUTTON_NAMES = frozenset({
     "忽略本次更新",
     "忽略此次更新",
     "忽略這次更新",
-    "忽略此次更新",
     "skip this update",
     "skip this version",
 })
+_UPDATE_DIALOG_DISCOVERY_SCAN_SECONDS = 5.0
 _UPDATE_DIALOG_CLICK_RETRY_SECONDS = 5.0
 _SAVE_DIALOG_BUTTON_NAMES = (
     "保存(&S)",
@@ -719,7 +719,8 @@ def _native_title_may_be_update_dialog(value):
     if not label:
         return False
     expected = {
-        _normalized_update_dialog_label(name) for name in _UPDATE_DIALOG_TITLES
+        _normalized_update_dialog_label(name)
+        for name in (*_UPDATE_DIALOG_TITLES, *_UPDATE_DIALOG_PRODUCT_NAMES)
     }
     return label in expected or any(item in label for item in expected)
 
@@ -728,6 +729,36 @@ def _find_update_dialog_dismiss_button(root, native_title=""):
     """Return the dismiss button only for a verified WeChat update dialog."""
     if root is None:
         return None
+
+    # Recent WeChat 4.x builds expose the updater as ``UpdateWindow`` but its
+    # native/root title is only ``微信``.  On that window wx4py's generic
+    # ``WalkControl`` can return an incomplete tree even though direct typed
+    # lookups still work.  Use the stable root id plus both action buttons as
+    # strong evidence before falling back to the normal tree-based verifier.
+    root_automation_id = _safe_control_text(root, "AutomationId").casefold()
+    if root_automation_id == "updatewindow":
+        direct_dismiss = None
+        for name in _UPDATE_DIALOG_DISMISS_BUTTON_NAMES:
+            direct_dismiss = _find_control(
+                root,
+                "ButtonControl",
+                timeout=0,
+                Name=name,
+            )
+            if direct_dismiss is not None:
+                break
+        direct_update = None
+        for name in _UPDATE_DIALOG_UPDATE_BUTTON_NAMES:
+            direct_update = _find_control(
+                root,
+                "ButtonControl",
+                timeout=0,
+                Name=name,
+            )
+            if direct_update is not None:
+                break
+        if direct_dismiss is not None and direct_update is not None:
+            return direct_dismiss
 
     controls = [root]
     controls.extend(
@@ -2253,6 +2284,37 @@ def _physical_double_click_control(control):
         return True
     except Exception:
         logger.debug("Win32 物理双击会话项失败", exc_info=True)
+        return False
+
+
+def _physical_click_control(control):
+    """Issue one real Win32 click at the current control center."""
+    try:
+        import win32api
+        import win32con
+
+        rect = control.BoundingRectangle
+        left, top = int(rect.left), int(rect.top)
+        right, bottom = int(rect.right), int(rect.bottom)
+        if right <= left or bottom <= top:
+            return False
+        x = (left + right) // 2
+        y = (top + bottom) // 2
+        win32api.SetCursorPos((x, y))
+        time.sleep(min(_UI_POLL_INTERVAL, 0.05))
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.02)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        logger.debug(
+            "已提交 Win32 物理单击 control_rect=(%d,%d,%d,%d)",
+            left,
+            top,
+            right,
+            bottom,
+        )
+        return True
+    except Exception:
+        logger.debug("Win32 物理单击控件失败", exc_info=True)
         return False
 
 
@@ -4666,6 +4728,7 @@ class WeChatListener:
         self._send_shutdown = threading.Event()
         self._active_send_workers = 0
         self._next_update_dialog_scan_at = 0.0
+        self._next_update_dialog_full_scan_at = 0.0
         self._update_dialog_first_seen = {}
         self._update_dialog_last_click_at = {}
         self._known_wechat_top_level_hwnds = set()
@@ -5464,7 +5527,7 @@ class WeChatListener:
                 session = candidates[0]
                 self._attach_session_id(session, session_id)
                 logger.info(
-                    "已将已有独立窗口按 WeFlow session ID 绑定 "
+                    "已将已有独立窗口按微信会话ID 绑定 "
                     "chat=%r session_id=%s hwnd=%s",
                     session.name,
                     session_id,
@@ -5472,7 +5535,7 @@ class WeChatListener:
                 )
             elif len(candidates) > 1:
                 logger.warning(
-                    "同一 WeFlow session ID 对应多个缓存窗口，拒绝猜测 "
+                    "同一微信会话ID 对应多个缓存窗口，拒绝猜测 "
                     "session_id=%s candidates=%s",
                     session_id,
                     [
@@ -5514,7 +5577,7 @@ class WeChatListener:
         # ``_sessions_by_session_id`` mapping does not need
         # an update.
         logger.info(
-            "WeFlow session ID 改名自动重绑：cached session 跟随 chat 名更新 "
+            "微信会话ID 改名自动重绑：cached session 跟随 chat 名更新 "
             "old=%r new=%r session_id=%s hwnd=%s",
             old_name,
             chat_name,
@@ -5568,7 +5631,7 @@ class WeChatListener:
         # only the title and the chat name change).
         self._hwnd_to_session_id[session.hwnd] = sid
         logger.info(
-            "WeFlow session ID 已绑定到 cached session: "
+            "微信会话ID 已绑定到 cached session: "
             "session_id=%s chat=%r hwnd=%s",
             sid,
             session.name,
@@ -5615,7 +5678,7 @@ class WeChatListener:
         self.running = True
         if self.callback is None:
             logger.info(
-                "微信 UIA 入站监控已禁用（WeFlow 入站不受影响）；"
+                "微信 UIA 入站监控已禁用（本地数据库入站不受影响）；"
                 "仍将打开并监控目标独立窗口"
             )
 
@@ -5641,7 +5704,7 @@ class WeChatListener:
             # around to handle outbound send commands on demand.
             self.processor = _ListenerStatus(self)
             logger.info(
-                "未配置 WX_TARGET_CHATS：入站消息由 WeFlow 监听，"
+                "未配置 WX_TARGET_CHATS：入站消息由本地数据库监听，"
                 "UI 线程仅在需要发送时按目标打开独立窗口"
             )
             self._touch_heartbeat()
@@ -5810,14 +5873,23 @@ class WeChatListener:
         if now < self._next_update_dialog_scan_at:
             return
         self._next_update_dialog_scan_at = (
-            now + WEMAI_UPDATE_DIALOG_SCAN_INTERVAL
+            now + _UPDATE_DIALOG_DISCOVERY_SCAN_SECONDS
         )
+        full_scan_due = now >= self._next_update_dialog_full_scan_at
 
         # A search/send worker may currently own the foreground. Do not let an
         # update-popup click interrupt that focus-sensitive sequence.
         if not self._foreground_ui_lock.acquire(blocking=False):
+            self._next_update_dialog_scan_at = min(
+                self._next_update_dialog_scan_at,
+                now + _UI_POLL_INTERVAL,
+            )
             return
         try:
+            if full_scan_due:
+                self._next_update_dialog_full_scan_at = (
+                    now + WEMAI_UPDATE_DIALOG_SCAN_INTERVAL
+                )
             main_hwnd = getattr(getattr(self.wx, "window", None), "hwnd", 0)
             windows = _list_wechat_windows_for_main(main_hwnd)
             current_hwnds = {hwnd for hwnd, _title, _class_name in windows if hwnd}
@@ -5828,7 +5900,8 @@ class WeChatListener:
                 if not hwnd or hwnd == main_hwnd:
                     continue
                 if (
-                    hwnd not in new_hwnds
+                    not full_scan_due
+                    and hwnd not in new_hwnds
                     and hwnd not in self._update_dialog_first_seen
                     and not _native_title_may_be_update_dialog(title)
                 ):
@@ -5874,8 +5947,16 @@ class WeChatListener:
                     )
                     continue
 
-                # Re-resolve the control immediately before clicking. Qt can
-                # rebuild the accessibility tree while the dialog animates.
+                if not _activate_native_window(hwnd):
+                    logger.warning(
+                        "微信更新弹窗无法取得前台焦点，将在下次扫描重试 "
+                        "hwnd=%s",
+                        hwnd,
+                    )
+                    continue
+
+                # Re-resolve after activation. Qt can rebuild the accessibility
+                # tree while the dialog animates or changes foreground state.
                 root = _control_from_handle(hwnd)
                 button = _find_update_dialog_dismiss_button(
                     root,
@@ -5883,7 +5964,8 @@ class WeChatListener:
                 )
                 if button is None:
                     continue
-                _click_uia_control(button)
+                if not _physical_click_control(button):
+                    _call_uia_without_wait(button.Click, simulateMove=True)
                 self._update_dialog_last_click_at[hwnd] = now
                 self._next_update_dialog_scan_at = min(
                     self._next_update_dialog_scan_at,
@@ -5891,7 +5973,7 @@ class WeChatListener:
                 )
                 self._touch_heartbeat()
                 logger.info(
-                    "已点击微信更新弹窗的“忽略本次更新” "
+                    "已向微信更新弹窗提交“忽略本次更新”物理点击 "
                     "hwnd=%s waited=%.1fs",
                     hwnd,
                     now - first_seen,
@@ -7575,7 +7657,7 @@ class WeChatListener:
                 self._adopt_refreshed_window_title(session, actual)
             if log_success:
                 logger.info(
-                    "WeFlow session_id 已绑定，跳过标题检查 "
+                    "微信会话ID 已绑定，跳过标题检查 "
                     "session_id=%s chat=%r hwnd=%s actual_title=%r",
                     session.session_id,
                     chat_name,

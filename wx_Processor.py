@@ -32,7 +32,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, url2pathn
 import aiohttp
 import maim_message.api as _maim_api
 import maim_message.ws_connection as _maim_ws
-from PIL import Image
 from maim_message import (
     BaseMessageInfo,
     GroupInfo,
@@ -43,6 +42,7 @@ from maim_message import (
     TargetConfig,
     UserInfo,
 )
+from PIL import Image
 
 from audio_segments import split_audio_file
 from chat_name_utils import normalize_chat_name
@@ -59,9 +59,10 @@ from config import (
     IMAGE_TEMP_PREFIX,
     IMAGE_TEMP_RETENTION_SECONDS,
     INBOUND_ROUTER_CONCURRENCY,
-    MAIBOT_API_URL,
-    MAIBOT_DATA_DIR,
     LOCAL_FILE_DELIVERY_ROOT,
+    MAIBOT_API_URL,
+    MAIBOT_API_TOKEN,
+    MAIBOT_DATA_DIR,
     MAX_MEDIA_BYTES,
     MEDIA_DOWNLOAD_MAX_REDIRECTS,
     MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
@@ -70,6 +71,8 @@ from config import (
     VOICE_COMMAND_TIMEOUT_SECONDS,
     WEMAI_BOT_NICKNAME,
 )
+from sender_identity_aliases import SenderIdentityAliasStore
+from unicode_utils import sanitize_unicode
 from wx_exceptions import ChatNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -78,16 +81,16 @@ _VOICE_SEGMENT_SECONDS = 60.0
 _OUTBOUND_PRIORITY_NORMAL = 0
 _OUTBOUND_PRIORITY_VOICE = 1
 
-# WeFlow 在暂时无法读取部分成员头像时会返回一张固定占位图。它的 URL
+# 微信在暂时无法读取部分成员头像时会返回一张固定占位图。它的 URL
 # 因成员而异，不能按 URL 黑名单判断；使用低分辨率差异哈希可以兼容 PNG/JPEG
 # 重编码，同时把检测成本控制在后台线程中的亚毫秒级。
-_WEFLOW_UNAVAILABLE_AVATAR_DHASH = int(
+_UNAVAILABLE_AVATAR_DHASH = int(
     "080030007200721030240c6218d131806504c00090000e14b2f233420c2c2000",
     16,
 )
-_WEFLOW_UNAVAILABLE_AVATAR_MAX_HASH_DISTANCE = 12
-_WEFLOW_UNAVAILABLE_AVATAR_MIN_SIZE = 96
-_WEFLOW_UNAVAILABLE_AVATAR_MAX_SIZE = 160
+_UNAVAILABLE_AVATAR_MAX_HASH_DISTANCE = 12
+_UNAVAILABLE_AVATAR_MIN_SIZE = 96
+_UNAVAILABLE_AVATAR_MAX_SIZE = 160
 
 
 class _UncompressedMaimWebSocketClient(_maim_ws.WebSocketClient):
@@ -155,13 +158,13 @@ class _UncompressedMaimWebSocketClient(_maim_ws.WebSocketClient):
 # 用于关闭大帧压缩兼容问题，不修改已安装的 maim_message 包。
 _maim_api.WebSocketClient = _UncompressedMaimWebSocketClient
 
-# WeFlow 将普通用户消息和微信系统事件都放在 ``message.new`` 中。无法还原操作者的
+# 本地数据库把普通消息和微信系统事件放在同一消息表中。无法还原操作者的
 # 系统事件使用独立虚拟用户：消息仍留在原群聊流内，又不会与真实成员冲突或继承
 # 旧“未知发送者”的错误头像。上游账号 ``weixin`` 会被识别，但本地另用新 ID，
 # 避免命中历史污染缓存。
-_WEFLOW_SYSTEM_SENDER_ID = "weixin_system_message"
-_WEFLOW_SYSTEM_SENDER_NAME = "微信系统消息"
-_WEFLOW_SYSTEM_UPSTREAM_IDS = {"weixin", _WEFLOW_SYSTEM_SENDER_ID}
+_WECHAT_SYSTEM_SENDER_ID = "weixin_system_message"
+_WECHAT_SYSTEM_SENDER_NAME = "微信系统消息"
+_WECHAT_SYSTEM_UPSTREAM_IDS = {"weixin", _WECHAT_SYSTEM_SENDER_ID}
 
 # UI 发送可能占用线程 10~30 秒，必须与图片 base64、缓存清理等短任务分池，
 # 否则少量慢出站就会耗尽共享线程并拖延入站。UI 池允许多个独立窗口并行；辅助池
@@ -247,7 +250,7 @@ class MessageProcessor:
     不同会话最多 ``INBOUND_ROUTER_CONCURRENCY`` 路并发。出站按接收方建立优先级
     队列，保证单个窗口内有序，并允许文本/图片/文件在语音分段之间优先执行。
 
-    本类运行自己的 asyncio 线程；WeFlow 和微信 UI 线程只能通过公开入队方法或
+    本类运行自己的 asyncio 线程；本地数据库和微信 UI 线程只能通过公开入队方法或
     ``ui_submit`` 回调与它交互，不得直接操作内部 asyncio 队列。
     """
 
@@ -278,14 +281,17 @@ class MessageProcessor:
         self._router_heartbeat = time.monotonic()
         self._id_lock = threading.RLock()
         self._id_to_name = {}
+        self._platform_account_id = ""
+        self._platform_account_nickname = ""
         self._avatar_lock = threading.RLock()
         self._avatar_downloads = set()
         self._db_path = str(Path(ID_MAP_FILE).with_suffix(".sqlite3"))
         self._init_storage()
         self._load_id_map()
+        self._sender_aliases = SenderIdentityAliasStore(self._db_path)
 
         route = RouteConfig(route_config={
-            platform: TargetConfig(url=MAIBOT_API_URL, token=None)
+            platform: TargetConfig(url=MAIBOT_API_URL, token=MAIBOT_API_TOKEN or None)
         })
         self.router = Router(route)
         self.router.register_class_handler(self._handle_maibot_response)
@@ -481,16 +487,7 @@ class MessageProcessor:
                     logger.debug("id_map 清理失败", exc_info=True)
 
     def _run_image_gc(self):
-        """Delete inbound media files older than their configured TTL.
-
-        The WeFlow listener writes a ``weflow_<rawid>_*`` tempfile into
-        ``IMAGE_SAVE_DIR`` for every inbound media message; the path is
-        then stored in the SQLite ``inbound`` payload. After the message
-        is delivered and the row is purged, the file is orphaned. The
-        UI worker also copies successful previews into the same directory
-        under ``微信图片_*``; those are user-visible but still need a TTL
-        to keep the directory bounded on long-running deployments.
-        """
+        """删除超过保留期的入站媒体和用户可见图片。"""
         now = time.time()
         deleted = 0
         for prefix, max_age in (
@@ -583,6 +580,9 @@ class MessageProcessor:
             self._thread.join(timeout)
             if self._thread.is_alive():
                 logger.error("Router 线程未在时限内退出")
+        sender_aliases = getattr(self, "_sender_aliases", None)
+        if sender_aliases is not None:
+            sender_aliases.close(timeout=min(5, timeout))
         # 关闭两个阻塞任务池，防止 URL/base64 或 UI 提交任务活得比事件循环更久。
         # 此时待处理协程已经取消，因此不等待仍在系统调用中的线程；shutdown 会阻止
         # 新任务并促使工作线程尽快释放 UIA 引用。重复关闭及空队列均安全。
@@ -1294,7 +1294,7 @@ class MessageProcessor:
     def enqueue_message(self, chat_name, message_data):
         """只持久化轻量入站信封，不在生产者线程中转换媒体。
 
-        该方法位于 WeFlow 回调热路径。先写 SQLite 再返回，确保进程异常退出后消息
+        该方法位于本地数据库入站热路径。先写 SQLite 再返回，确保进程异常退出后消息
         仍可恢复；图片转换、头像缓存和 Router 网络发送均由后台会话任务完成。
         """
         if not self.inbound_enabled:
@@ -1302,7 +1302,15 @@ class MessageProcessor:
         try:
             chat_name = self._text(chat_name)
             data = dict(message_data or {})
-            # 系统事件仍按 WeFlow sessionType 进入原私聊或群聊；后续构建消息时
+            (chat_name, data), repaired_units = sanitize_unicode((chat_name, data))
+            if repaired_units:
+                logger.warning(
+                    "入站消息包含不完整 UTF-16 字符，已在可靠队列前修复 "
+                    "chat=%s units=%d",
+                    chat_name,
+                    repaired_units,
+                )
+            # 系统事件仍按微信会话类型进入原私聊或群聊；后续构建消息时
             # 根据明确系统标记识别，不能在这里放宽 chat_type。
             if data.get("chat_type") not in {"private", "group"}:
                 raise ValueError(
@@ -1360,10 +1368,10 @@ class MessageProcessor:
         )
         if group_avatar_url and data["chat_type"] == "group":
             data["group_avatar_url"] = group_avatar_url
-        system_event = self._text(raw.get("weflowSystemEvent"))
-        if system_event and system_event != "pat":
-            data["weflow_system_event"] = system_event
-        # 传递 WeFlow 会话真 ID，使 ``_build_message`` 按稳定 ID 计算 group_id，
+        system_event = self._text(raw.get("wechatSystemEvent"))
+        if system_event:
+            data["wx_notice_type"] = system_event
+        # 传递微信会话ID，使 ``_build_message`` 按稳定 ID 计算 group_id，
         # 而不是使用可能改名的显示名称。显示名仍原样交给 MaiBot 自行刷新。
         sid = self._text(getattr(event, "session_id", ""))
         if sid:
@@ -1373,6 +1381,9 @@ class MessageProcessor:
         swid = self._text(getattr(event, "sender_wxid", ""))
         if swid:
             data["sender_id"] = swid
+        sender_identity_source = self._text(raw.get("senderIdentitySource"))
+        if sender_identity_source:
+            data["sender_identity_source"] = sender_identity_source
         profile_nickname = self._text(
             getattr(event, "user_nickname", "")
         ) or self._text(raw.get("fromNickName")) or self._text(
@@ -1388,10 +1399,35 @@ class MessageProcessor:
         for name in ("event", "rawid", "sessionId", "sessionType"):
             if name in raw:
                 data[name] = raw[name]
+        data["wx_message_type"] = self._text(
+            raw.get("wxMessageType") or data.get("type")
+        ) or "text"
+        data["wx_wechat_type"] = raw.get("localType")
+        data["wx_app_type"] = raw.get("appType")
+        data["wx_local_message_id"] = raw.get("localMessageId")
+        data["wx_server_message_id"] = raw.get("serverMessageId") or raw.get("rawid")
+        self_id = self._text(raw.get("selfId") or raw.get("self_id"))
+        if self_id:
+            data["self_id"] = self_id
         # 引用元数据必须随可靠队列一起持久化，让 MaiBot 能区分引用回复和普通文本，
         # 且无需了解微信 XML 格式。
         if isinstance(raw.get("quote"), dict):
             data["quote"] = raw["quote"]
+        if isinstance(raw.get("app"), dict):
+            data["wx_app"] = raw["app"]
+        if isinstance(raw.get("location"), dict):
+            data["wx_location"] = raw["location"]
+        if isinstance(raw.get("video"), dict):
+            data["wx_video"] = raw["video"]
+        if isinstance(raw.get("contactCard"), dict):
+            data["wx_contact_card"] = raw["contactCard"]
+        if isinstance(raw.get("notice"), dict):
+            data["wx_notice"] = raw["notice"]
+        if raw.get("fileSize") not in (None, ""):
+            data["file_size"] = raw["fileSize"]
+        file_md5 = self._text(raw.get("fileMd5"))
+        if file_md5:
+            data["file_md5"] = file_md5
         reply_to = self._text(raw.get("replyToMessageId"))
         if reply_to:
             data["replyToMessageId"] = reply_to
@@ -1408,13 +1444,46 @@ class MessageProcessor:
                 break
         if "content" in raw:
             data["raw_content"] = raw["content"]
+        if isinstance(raw.get("chatRecordList"), list):
+            # 合并记录仍以文本交给当前 MaiBot Legacy 转换器；同时把结构化节点放进
+            # additional_config，保留能可靠解析出的内部成员真 ID，供后续版本使用。
+            data["wx_chat_record_title"] = self._text(raw.get("chatRecordTitle"))
+            data["wx_chat_record_list"] = raw["chatRecordList"]
+        if isinstance(raw.get("mentionUserIds"), list):
+            data["mention_user_ids"] = raw["mentionUserIds"]
+        if isinstance(raw.get("mentionUsers"), list):
+            data["mention_users"] = raw["mentionUsers"]
+        data["pat_from_wxid"] = self._text(raw.get("patFromWxid"))
+        data["pat_target_wxid"] = self._text(raw.get("patTargetWxid"))
         return self.enqueue_message(getattr(event, "group", ""), data)
+
+    def observe_account_profile(self, profile):
+        """记录微信当前账号身份，并独立缓存机器人头像。"""
+        if not isinstance(profile, dict):
+            return
+        user_id = self._text(profile.get("userId") or profile.get("user_id"))
+        if not user_id:
+            return
+        self._platform_account_id = user_id
+        nickname = self._text(profile.get("nickname"))
+        if nickname:
+            self._platform_account_nickname = nickname
+        avatar_url = self._text(profile.get("avatarUrl") or profile.get("avatar_url"))
+        if avatar_url:
+            self._platform_account_avatar_url = avatar_url
+            self._schedule_avatar_cache(avatar_url, user_id)
+        logger.info(
+            "微信机器人账号资料已刷新 user_id=%s nickname=%s avatar=%s",
+            user_id,
+            self._text(profile.get("nickname")) or user_id,
+            bool(avatar_url),
+        )
 
     # 兼容旧调用名；当前实现只入队持久化，不阻塞等待网络发送。
     process_message = enqueue_message
 
     def _inbound_session_key(self, chat_name, data):
-        """返回一个会话的稳定串行键，优先使用 WeFlow 真 ID。"""
+        """返回一个会话的稳定串行键，优先使用微信会话ID。"""
         data = data if isinstance(data, dict) else {}
         chat_type = self._text(data.get("chat_type")) or "unknown"
         native_id = self._text(
@@ -1455,11 +1524,20 @@ class MessageProcessor:
             claimed = 0
             if capacity and self._router_is_connected():
                 now = time.time()
+                active_sessions = tuple(active)
+                active_filter = ""
+                if active_sessions:
+                    placeholders = ",".join("?" for _ in active_sessions)
+                    active_filter = (
+                        "AND current.session_key NOT IN ("
+                        f"{placeholders}) "
+                    )
                 with contextlib.closing(self._connect()) as db, db:
                     rows = db.execute(
                         "SELECT current.message_id,current.payload,current.attempts,"
                         "current.session_key FROM inbound AS current "
                         "WHERE current.state='pending' AND current.next_try<=? "
+                        + active_filter +
                         "AND NOT EXISTS ("
                         "SELECT 1 FROM inbound AS older "
                         "WHERE older.session_key=current.session_key "
@@ -1467,12 +1545,10 @@ class MessageProcessor:
                         "AND (older.created<current.created OR "
                         "(older.created=current.created AND older.rowid<current.rowid))"
                         ") ORDER BY current.created,current.rowid LIMIT ?",
-                        (now, capacity),
+                        (now, *active_sessions, capacity),
                     ).fetchall()
                     for row in rows:
                         message_id, payload, attempts, session_key = row
-                        if session_key in active:
-                            continue
                         updated = db.execute(
                             "UPDATE inbound SET state='sending' "
                             "WHERE message_id=? AND state='pending'",
@@ -1502,10 +1578,19 @@ class MessageProcessor:
             # 先清事件再做最后一次就绪查询，可封住“查询为空后、开始等待前”入队的
             # 竞态：新记录要么被下方查询看到，要么会再次设置唤醒事件。
             if capacity and self._router_is_connected():
+                active_sessions = tuple(active)
+                active_filter = ""
+                if active_sessions:
+                    placeholders = ",".join("?" for _ in active_sessions)
+                    active_filter = (
+                        "AND current.session_key NOT IN ("
+                        f"{placeholders}) "
+                    )
                 with contextlib.closing(self._connect()) as db, db:
                     ready = db.execute(
                         "SELECT 1 FROM inbound AS current "
                         "WHERE current.state='pending' AND current.next_try<=? "
+                        + active_filter +
                         "AND NOT EXISTS ("
                         "SELECT 1 FROM inbound AS older "
                         "WHERE older.session_key=current.session_key "
@@ -1513,7 +1598,7 @@ class MessageProcessor:
                         "AND (older.created<current.created OR "
                         "(older.created=current.created AND older.rowid<current.rowid))"
                         ") LIMIT 1",
-                        (time.time(),),
+                        (time.time(), *active_sessions),
                     ).fetchone()
                 if ready:
                     continue
@@ -1585,7 +1670,8 @@ class MessageProcessor:
             raise
         except Exception as exc:
             attempts += 1
-            if attempts >= 10:
+            permanent = isinstance(exc, (TypeError, ValueError))
+            if permanent or attempts >= 10:
                 self._store_dead_letter(
                     message_id,
                     {"direction": "inbound", "message": stored},
@@ -1608,24 +1694,26 @@ class MessageProcessor:
                             message_id,
                         ),
                     )
-            logger.warning(
-                "入站投递失败，将按会话顺序重试 id=%s session=%s attempt=%d: %s",
-                message_id,
-                session_key,
-                attempts,
-                exc,
-            )
+            if permanent:
+                logger.error(
+                    "入站消息包含不可恢复的数据，已立即进入死信以解除会话阻塞 "
+                    "id=%s session=%s: %s",
+                    message_id,
+                    session_key,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "入站投递失败，将按会话顺序重试 id=%s session=%s attempt=%d: %s",
+                    message_id,
+                    session_key,
+                    attempts,
+                    exc,
+                )
 
     @staticmethod
     def _delete_delivered_inbound_file(event_data):
-        """Free the on-disk media file referenced by a delivered inbound.
-
-        Called from :meth:`_process_inbound_queue` after the message
-        has been sent to the Router. Only deletes paths that look like
-        WeFlow temp files (prefix + directory match) so we never touch
-        user files. Failure is silently logged; the periodic GC will
-        catch any leftover next sweep.
-        """
+        """释放已投递的入站临时媒体，绝不触碰用户文件。"""
         if not event_data:
             return
         # 文件段通过本地路径交给 MaiBot，Router 返回只表示 WebSocket
@@ -1633,27 +1721,40 @@ class MessageProcessor:
         # 大文件在下游异步读取前被删除。图片/语音已经编码进消息，可即时清理。
         if str(event_data.get("type", "")).casefold() == "file":
             return
-        content = event_data.get("content")
-        if not isinstance(content, str) or not content:
-            return
-        try:
-            abs_path = os.path.abspath(content)
-        except (TypeError, ValueError):
-            return
         expected_dir = os.path.abspath(IMAGE_SAVE_DIR)
-        if os.path.commonpath([abs_path, expected_dir]) != expected_dir:
-            return
-        basename = os.path.basename(abs_path)
-        if not basename.startswith(IMAGE_TEMP_PREFIX):
-            return
-        try:
-            os.unlink(abs_path)
-        except FileNotFoundError:
-            return
-        except OSError:
-            logger.debug(
-                "释放入站媒体文件失败 path=%s", abs_path, exc_info=True
-            )
+
+        def remove_path(content):
+            if not isinstance(content, str) or not content:
+                return
+            try:
+                abs_path = os.path.abspath(content)
+                if os.path.commonpath([abs_path, expected_dir]) != expected_dir:
+                    return
+            except (TypeError, ValueError):
+                return
+            if not os.path.basename(abs_path).startswith(IMAGE_TEMP_PREFIX):
+                return
+            try:
+                os.unlink(abs_path)
+            except FileNotFoundError:
+                return
+            except OSError:
+                logger.debug(
+                    "释放入站媒体文件失败 path=%s", abs_path, exc_info=True
+                )
+
+        remove_path(event_data.get("content"))
+
+        def walk(nodes, depth=0):
+            if not isinstance(nodes, list) or depth > 4:
+                return
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                remove_path(node.get("localPath"))
+                walk(node.get("chatRecordList"), depth + 1)
+
+        walk(event_data.get("wx_chat_record_list"))
 
     def _build_message(self, chat_name, data, message_id=None):
         chat_name = self._text(chat_name)
@@ -1661,44 +1762,69 @@ class MessageProcessor:
         sender_name = self._text(data.get("sender")) or "unknown"
         content = self._text(data.get("content"))
         chat_type = data.get("chat_type")
-        # chat_type 必须由 WeFlow sessionType 明确给出。系统事件仍属于原私聊或
+        # chat_type 必须由本地数据库会话明确给出。系统事件仍属于原私聊或
         # 群聊，仅在下方通过明确系统标记识别，不能发明第三种聊天类型。
         if chat_type not in {"private", "group"}:
             raise ValueError(f"缺少可靠 chat_type: {chat_type!r}")
-        # 群聊优先以 WeFlow 会话真 ID 生成稳定 group_id，群改名不会创建新聊天流；
+        # 群聊优先以微信会话ID生成稳定 group_id，群改名不会创建新聊天流；
         # chat_name 仍保留最新显示值。纯 UI 入站拿不到真 ID，只能按名称兼容回退。
         stable_chat_id = self._text(data.get("chat_id")) or chat_name
         # 用户优先以任意格式的微信真 ID 生成稳定 user_id；显示昵称只负责展示，
         # 修改资料或群名片不能改变人物主键。纯 UI 入站没有真 ID 时再按显示名回退。
         stable_sender_id = self._text(data.get("sender_id"))
+        sender_identity_source = self._text(
+            data.get("sender_identity_source")
+        )
+        if (
+            not stable_sender_id
+            and chat_type == "group"
+            and self._text(data.get("chat_id"))
+        ):
+            # 兼容升级前已经进入可靠队列、但尚未构建的消息，也让直接调用处理器
+            # 的嵌入方式获得相同身份恢复能力。此处仍是纯内存查询。
+            stable_sender_id = self.resolve_sender_alias(
+                stable_chat_id,
+                sender_name,
+                data.get("user_nickname"),
+                data.get("group_card_name"),
+            )
+            if stable_sender_id:
+                sender_identity_source = "persistent_alias"
         # 正常路径复用生产者预先计算的 message_id；旧调用和测试未传值时才补算。
         if not message_id:
             message_id = self._inbound_message_id(chat_name, data)
-        # 跨会话身份规则：同一微信真 ID 无论出现在私聊还是任意群聊，均进入
-        # ``user`` 命名空间并得到相同 user_id；``group`` 使用独立命名空间，避免
-        # 用户 ID 与群 ID 碰撞。
+        # 可靠的微信原生 ID 必须原样交给 MaiBot。MaiBot 的 bot account、权限、
+        # @ 判断和 Platform IO 路由都以原生账号为契约；只有上游确实拿不到原生
+        # ID 时才使用隔离的哈希回退身份。
         profile_nickname = self._text(data.get("user_nickname")) or sender_name
-        # 空 sender_id 常见于 WeFlow 历史尚未同步的普通群消息，不能据此
+        # 空 sender_id 不能据此
         # 判成系统消息。系统身份必须来自监听层的明确事件标记，或上游明确
         # 返回的系统账号 ID。
-        is_weflow_system = bool(self._text(data.get("chat_id"))) and (
-            bool(self._text(data.get("weflow_system_event")))
-            or stable_sender_id.casefold() in _WEFLOW_SYSTEM_UPSTREAM_IDS
+        is_wechat_system = bool(self._text(data.get("chat_id"))) and (
+            self._text(data.get("wx_notice_type")) == "system"
+            or (
+                self._text(data.get("wx_message_type")) == "system"
+                and stable_sender_id.casefold() in _WECHAT_SYSTEM_UPSTREAM_IDS
+            )
         )
-        if is_weflow_system:
-            user_id = self._stable_id("user", _WEFLOW_SYSTEM_SENDER_ID)
-            display_nickname = _WEFLOW_SYSTEM_SENDER_NAME
-            user_id_source = "weflow_system_weixin"
+        if is_wechat_system:
+            user_id = _WECHAT_SYSTEM_SENDER_ID
+            display_nickname = _WECHAT_SYSTEM_SENDER_NAME
+            user_id_source = "wechat_system_weixin"
         elif stable_sender_id:
-            user_id = self._stable_id("user", stable_sender_id)
+            user_id = stable_sender_id
             display_nickname = profile_nickname
-            user_id_source = "weflow_talker_wxid"
+            user_id_source = (
+                "wechat_persisted_sender_alias"
+                if sender_identity_source == "persistent_alias"
+                else "wechat_sender_wxid"
+            )
         elif chat_type == "private" and self._text(data.get("chat_id")):
             # 私聊推送通常没有 talker，但 sessionId 就是对方微信真 ID。以它生成
             # user_id，可与同一用户在群聊中的身份合并；sender_name 仅作为最新展示名。
-            user_id = self._stable_id("user", self._text(data.get("chat_id")))
+            user_id = self._text(data.get("chat_id"))
             display_nickname = profile_nickname
-            user_id_source = "weflow_private_session_id"
+            user_id_source = "wechat_private_session_id"
         elif chat_type == "group" and self._text(data.get("chat_id")):
             # 群成员真 ID 暂不可用时，以稳定群 ID + 当前显示名建立隔离的
             # 临时身份。该命名空间不会与任何格式的真实微信 ID 冲突，且
@@ -1708,7 +1834,7 @@ class MessageProcessor:
             )
             user_id = self._stable_id("user_fallback", fallback_identity)
             display_nickname = profile_nickname
-            user_id_source = "weflow_group_display_fallback"
+            user_id_source = "wechat_group_display_fallback"
         else:
             # 纯 UIA 入站无法取得 chat_id 和 sender_id，只能按显示名建立隔离身份。
             # 这会在改名后产生新人物，但比把所有未知用户合并成系统账号更安全。
@@ -1744,7 +1870,7 @@ class MessageProcessor:
         group = None
         group_id = None
         if chat_type == "group":
-            group_id = self._stable_id("group", stable_chat_id)
+            group_id = stable_chat_id
             group = GroupInfo(
                 platform=self.platform,
                 group_id=group_id,
@@ -1768,22 +1894,162 @@ class MessageProcessor:
             content,
             data.get("type"),
             file_name=data.get("file_name"),
+            file_size=data.get("file_size"),
         )
         try:
             message_time = int(float(data.get("timestamp", time.time())))
         except (TypeError, ValueError) as exc:
             raise ValueError("消息 timestamp 必须是可转换为整数的时间戳") from exc
+        additional_config = {}
+        platform_account_id = self._text(
+            data.get("self_id")
+            or data.get("selfId")
+            or getattr(self, "_platform_account_id", "")
+        )
+        if platform_account_id:
+            self._platform_account_id = platform_account_id
+            # 与 NapCat 入站保持一致。MaiBot 使用 account_id 参与 session_id
+            # 计算；缺失该字段会继续命中升级前的旧聊天流。
+            additional_config["self_id"] = platform_account_id
+            additional_config["platform_io_account_id"] = platform_account_id
+        additional_config["platform_io_scope"] = "wx"
+        native_chat_id = self._text(data.get("chat_id"))
+        if chat_type == "group" and native_chat_id:
+            additional_config["platform_io_target_group_id"] = native_chat_id
+        elif chat_type == "private":
+            native_target_user_id = stable_sender_id or native_chat_id
+            if native_target_user_id:
+                additional_config["platform_io_target_user_id"] = native_target_user_id
+        wx_message_type = self._text(
+            data.get("wx_message_type") or data.get("type")
+        ) or "text"
+        additional_config.update({
+            "wx_chat_type": chat_type,
+            "wx_message_type": wx_message_type,
+            "wx_wechat_type": data.get("wx_wechat_type"),
+            "wx_app_type": data.get("wx_app_type"),
+            "wx_local_message_id": data.get("wx_local_message_id"),
+            "wx_server_message_id": self._text(
+                data.get("wx_server_message_id") or data.get("rawid")
+            ),
+            "wx_sender_id": user_id,
+            "wx_source_sender_id": stable_sender_id or user_id,
+            "wx_conversation_id": native_chat_id or stable_chat_id,
+            "wx_is_self": False,
+        })
+        raw_xml = self._text(data.get("raw_content"))
+        if raw_xml.startswith("<"):
+            additional_config["wx_raw_xml"] = raw_xml
+        if avatar_url:
+            additional_config["wx_user_avatar_url"] = avatar_url
+        if group_avatar_url and group_id:
+            additional_config["wx_group_avatar_url"] = group_avatar_url
+        self_avatar_url = self._text(
+            getattr(self, "_platform_account_avatar_url", "")
+        )
+        if self_avatar_url:
+            additional_config["wx_self_avatar_url"] = self_avatar_url
+        chat_record_list = data.get("wx_chat_record_list")
+        if isinstance(chat_record_list, list):
+            additional_config["wx_chat_record"] = {
+                "title": self._text(data.get("wx_chat_record_title")),
+                "nodes": chat_record_list,
+            }
+        for source_key, config_key in (
+            ("wx_location", "wx_location"),
+            ("wx_contact_card", "wx_contact_card"),
+        ):
+            value = data.get(source_key)
+            if isinstance(value, dict):
+                additional_config[config_key] = value
+        app_data = data.get("wx_app")
+        if isinstance(app_data, dict) and wx_message_type in {
+            "link", "mini_program", "transfer", "red_packet", "video_channel"
+        }:
+            additional_config[f"wx_{wx_message_type}"] = app_data
+        if wx_message_type in {"image", "emoji", "voice", "video", "file"}:
+            media = {
+                "name": self._text(data.get("file_name")),
+                "size": data.get("file_size") or 0,
+            }
+            if data.get("file_md5"):
+                media["md5"] = self._text(data.get("file_md5"))
+            if isinstance(data.get("wx_video"), dict):
+                media.update(data["wx_video"])
+            additional_config["wx_media"] = media
+        if wx_message_type in {"system", "recall", "pat"}:
+            additional_config["wx_notice_type"] = wx_message_type
+            additional_config["wx_notice_text"] = content
+        if wx_message_type == "recall" and isinstance(data.get("wx_notice"), dict):
+            additional_config["wx_recalled_message_id"] = self._text(
+                data["wx_notice"].get("recalled_message_id")
+            )
+        if wx_message_type == "pat":
+            pat_from_id = self._text(data.get("pat_from_wxid")) or user_id
+            pat_target_id = self._text(data.get("pat_target_wxid"))
+            pat_from_name = display_nickname or sender_name or pat_from_id
+            pat_target_name = (
+                self._text(getattr(self, "_platform_account_nickname", ""))
+                if pat_target_id and pat_target_id == platform_account_id
+                else pat_target_id
+            ) or pat_target_id
+            pat_text = content
+            if pat_from_name and pat_target_name:
+                pat_text = f'"{pat_from_name}" 拍了拍 "{pat_target_name}"'
+            additional_config.update({
+                "wx_pat_from_user_id": pat_from_id,
+                "wx_pat_from_user_name": pat_from_name,
+                "wx_patted_user_id": pat_target_id,
+                "wx_patted_user_name": pat_target_name,
+                "wx_pat_template": self._text(data.get("raw_content")),
+                "wx_pat_text": pat_text,
+                "wx_notice_text": pat_text,
+            })
+            # Legacy 时间线只渲染消息段；通知字段继续供插件识别。
+            segment = Seg(type="text", data=pat_text or "[拍一拍]")
+        if data.get("file_md5"):
+            additional_config["wx_file_md5"] = self._text(data.get("file_md5"))
         info = BaseMessageInfo(
             platform=self.platform,
             message_id=message_id,
             time=message_time,
             user_info=user,
             group_info=group,
+            additional_config=additional_config or None,
         )
         raw_message = self._text(data.get("raw_content"))
         if not raw_message and segment.type == "text":
             raw_message = segment.data
         segments = []
+        mention_ids = data.get("mention_user_ids") or data.get("mentionUserIds") or []
+        mention_users = data.get("mention_users") or data.get("mentionUsers") or []
+        if chat_type == "group" and isinstance(mention_ids, (list, tuple)):
+            if isinstance(mention_users, (list, tuple)):
+                mention_users_by_id = {
+                    self._text(item.get("userId") or item.get("user_id") or item.get("id")): item
+                    for item in mention_users
+                    if isinstance(item, dict)
+                    and self._text(item.get("userId") or item.get("user_id") or item.get("id"))
+                }
+            else:
+                mention_users_by_id = {}
+            for mention_id in mention_ids:
+                value = self._text(mention_id)
+                if not value:
+                    continue
+                metadata = mention_users_by_id.get(value, {})
+                target_nickname = self._text(
+                    metadata.get("nickname") or metadata.get("userNickname")
+                )
+                target_cardname = self._text(
+                    metadata.get("cardName") or metadata.get("card_name") or metadata.get("groupCardName")
+                )
+                at_data = {"target_user_id": value}
+                if target_nickname:
+                    at_data["target_user_nickname"] = target_nickname
+                if target_cardname:
+                    at_data["target_user_cardname"] = target_cardname
+                segments.append(Seg(type="at", data=at_data))
         reply_to = self._text(
             data.get("reply_to_message_id")
             or data.get("replyToMessageId")
@@ -1796,12 +2062,9 @@ class MessageProcessor:
                 or quote.get("message_id")
             )
         if reply_to:
-            # MaiBot only recognizes a native ``reply`` segment.  WeFlow's
-            # replyToMessageId is the original WeChat server rawid, while
-            # WeMai exposes inbound message IDs as md5(platform/event/rawid).
-            # Reproduce that deterministic ID here so MaiBot can resolve the
-            # quoted message from its message cache/database and populate the
-            # quoted sender/content for the planner and replyer.
+            # MaiBot 只识别原生 reply 段。微信引用字段保存原消息服务器 rawid，
+            # WeMai 对外使用 md5(platform/event/rawid)，因此在这里复现同一映射，
+            # 让 MaiBot 能从消息缓存或数据库还原引用发送者和正文。
             self_quote = self._is_self_quote(quote)
             target_message_id = ""
             if self_quote:
@@ -1811,7 +2074,7 @@ class MessageProcessor:
                     group_id=group_id,
                 )
             else:
-                target_message_id = self._weflow_message_id(reply_to)
+                target_message_id = self._wechat_message_id(reply_to)
             if target_message_id:
                 segments.append(Seg(type="reply", data=target_message_id))
             elif self_quote and segment.type == "text":
@@ -1822,6 +2085,26 @@ class MessageProcessor:
                     data=f"[回复了{quote_sender}的消息：{quote_content}]\n{segment.data}",
                 )
                 raw_message = segment.data
+            quoted_type = 0
+            if isinstance(quote, dict):
+                try:
+                    quoted_type = int(quote.get("wechatType") or 0)
+                except (TypeError, ValueError):
+                    quoted_type = 0
+                quoted_kind = {
+                    1: "text", 3: "image", 34: "voice", 42: "contact_card",
+                    43: "video", 47: "emoji", 48: "location", 49: "link",
+                }.get(quoted_type, "system")
+                additional_config.update({
+                    "reply_to": target_message_id,
+                    "wx_quoted_server_message_id": reply_to,
+                    "wx_quoted_wechat_type": quoted_type,
+                    "wx_quoted_kind": quoted_kind,
+                    "wx_quoted_sender_id": self._text(quote.get("senderWxid")),
+                    "wx_quoted_sender_name": self._text(quote.get("accountName")),
+                    "wx_quoted_is_self": self_quote,
+                    "wx_quoted_preview": self._text(quote.get("content"))[:2000],
+                })
             logger.info(
                 "构建 MaiBot 引用段 source_rawid=%s target_rawid=%s target_id=%s self_quote=%s quote_content=%r",
                 self._text(data.get("rawid")),
@@ -1833,6 +2116,7 @@ class MessageProcessor:
                 else "",
             )
         segments.append(segment)
+        segments.extend(self._chat_record_media_segments(chat_record_list))
         segment_list = Seg(type="seglist", data=segments)
         return MessageBase(
             message_info=info,
@@ -1844,7 +2128,7 @@ class MessageProcessor:
         rawid = self._text(data.get("rawid"))
         if rawid:
             event_name = self._text(data.get("event")) or "message.new"
-            return self._weflow_message_id(rawid, event_name)
+            return self._wechat_message_id(rawid, event_name)
         sender_name = self._text(data.get("sender")) or "unknown"
         content = self._text(data.get("content"))
         chat_type = data.get("chat_type")
@@ -1856,8 +2140,8 @@ class MessageProcessor:
             usedforsecurity=False,
         ).hexdigest()
 
-    def _weflow_message_id(self, rawid, event_name="message.new"):
-        """Map one WeFlow raw server ID to WeMai's deterministic message ID."""
+    def _wechat_message_id(self, rawid, event_name="message.new"):
+        """把微信服务器消息 ID 映射为 WeMai 的确定性消息 ID。"""
         rawid = self._text(rawid)
         event_name = self._text(event_name) or "message.new"
         if not rawid:
@@ -1889,7 +2173,15 @@ class MessageProcessor:
 
     @staticmethod
     def _normalize_quote_text(value):
-        return re.sub(r"\s+", " ", str(value or "")).strip()
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+        if normalized.casefold() in {
+            "[image]",
+            "[图片]",
+            "[图片消息]",
+            "[图片，识别中.....]",
+        }:
+            return "[image]"
+        return normalized
 
     def _resolve_outgoing_reply_id(self, quote, *, user_id, group_id=None):
         """Resolve a WeChat self-message rawid to MaiBot's original send_api ID."""
@@ -1920,17 +2212,28 @@ class MessageProcessor:
             ) as db:
                 db.execute("PRAGMA query_only=ON")
                 params = [self.platform, start, end]
-                scope_sql = "group_id=?"
                 if group_id:
-                    params.append(group_id)
+                    group_ids = [group_id]
+                    legacy_group_id = self._stable_id("group", group_id)
+                    if legacy_group_id not in group_ids:
+                        group_ids.append(legacy_group_id)
+                    placeholders = ",".join("?" for _ in group_ids)
+                    scope_sql = f"group_id IN ({placeholders})"
+                    params.extend(group_ids)
                 else:
+                    user_ids = [user_id]
+                    legacy_user_id = self._stable_id("user", user_id)
+                    if legacy_user_id not in user_ids:
+                        user_ids.append(legacy_user_id)
+                    user_placeholders = ",".join("?" for _ in user_ids)
                     sessions = [
                         row[0]
                         for row in db.execute(
                             "SELECT session_id FROM chat_sessions "
-                            "WHERE platform=? AND user_id=? AND group_id IS NULL "
+                            f"WHERE platform=? AND user_id IN ({user_placeholders}) "
+                            "AND group_id IS NULL "
                             "ORDER BY last_active_timestamp DESC LIMIT 5",
-                            (self.platform, user_id),
+                            (self.platform, *user_ids),
                         )
                         if row[0]
                     ]
@@ -1939,9 +2242,10 @@ class MessageProcessor:
                             row[0]
                             for row in db.execute(
                                 "SELECT session_id FROM mai_messages "
-                                "WHERE platform=? AND user_id=? AND group_id IS NULL "
+                                f"WHERE platform=? AND user_id IN ({user_placeholders}) "
+                                "AND group_id IS NULL "
                                 "GROUP BY session_id ORDER BY MAX(timestamp) DESC LIMIT 5",
-                                (self.platform, user_id),
+                                (self.platform, *user_ids),
                             )
                             if row[0]
                         ]
@@ -1990,8 +2294,8 @@ class MessageProcessor:
         return matches[0][1]
 
     def is_inbound_known(self, rawid, event_name="message.new"):
-        """Fast persistent deduplication probe for WeFlow SSE replay frames."""
-        message_id = self._weflow_message_id(rawid, event_name)
+        """快速检查本地数据库重放事件是否已经进入可靠队列。"""
+        message_id = self._wechat_message_id(rawid, event_name)
         if not message_id:
             return False
         with self._connect() as db:
@@ -2000,14 +2304,32 @@ class MessageProcessor:
                 (message_id,),
             ).fetchone() is not None
 
-    def _inbound_segment(self, content, message_type=None, file_name=None):
+    def _inbound_segment(
+        self,
+        content,
+        message_type=None,
+        file_name=None,
+        file_size=None,
+    ):
         is_declared_image = str(message_type or "").casefold() == "image"
         is_declared_file = str(message_type or "").casefold() == "file"
         is_declared_voice = str(message_type or "").casefold() == "voice"
         is_declared_emoji = str(message_type or "").casefold() == "emoji"
         has_local_file = isinstance(content, (str, os.PathLike)) and os.path.isfile(content)
-        if is_declared_image and not has_local_file:
-            raise ValueError("入站图片消息缺少已保存的本地文件")
+        if is_declared_image:
+            if has_local_file:
+                try:
+                    size = os.path.getsize(content)
+                    if size > MAX_MEDIA_BYTES:
+                        raise ValueError("入站图片超过尺寸上限")
+                    raw = Path(content).read_bytes()
+                    self._validate_image(raw[:16])
+                    return Seg(type="image", data=base64.b64encode(raw).decode("ascii"))
+                except (OSError, ValueError) as exc:
+                    logger.warning("入站图片无法转换，降级为文字 path=%s: %s", content, exc)
+            else:
+                logger.warning("入站图片缺少可读本地文件，降级为文字 path=%r", content)
+            return Seg(type="text", data="[图片消息]")
         if is_declared_voice:
             logger.debug(
                 "准备转换入站语音为 MaiBot voice 段 path=%r has_local_file=%s",
@@ -2064,7 +2386,14 @@ class MessageProcessor:
                         # 文件内容保留为本地路径，避免把 200 MiB 文件编码
                         # 成 base64 放进 WebSocket 消息；入站文件由 MaiBot
                         # 的文件段消费者读取该受控媒体目录。
-                        return Seg(type="file", data=os.fspath(source_path))
+                        return Seg(
+                            type="file",
+                            data={
+                                "name": source_path.name,
+                                "size": size,
+                                "url": source_path.as_uri(),
+                            },
+                        )
                 except (OSError, ValueError) as exc:
                     logger.warning("读取入站文件失败 path=%s: %s", content, exc)
             source_name = str(file_name or "").strip()
@@ -2073,17 +2402,58 @@ class MessageProcessor:
             source_name = Path(source_name.replace("\\", "/")).name
             safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", source_name).strip(" .")
             safe_name = safe_name or "微信文件.bin"
-            return Seg(type="text", data=f"[文件消息：{safe_name}]")
-        if IMAGE_RECOGNITION_ENABLED and is_declared_image and has_local_file:
-            size = os.path.getsize(content)
-            if size > MAX_MEDIA_BYTES:
-                raise ValueError("入站图片超过尺寸上限")
-            raw = Path(content).read_bytes()
-            self._validate_image(raw[:16])
-            return Seg(type="image", data=base64.b64encode(raw).decode("ascii"))
-        if is_declared_image:
-            return Seg(type="text", data="[图片消息]")
+            payload = {"name": safe_name}
+            try:
+                normalized_size = int(file_size)
+            except (TypeError, ValueError):
+                normalized_size = 0
+            if normalized_size > 0:
+                payload["size"] = normalized_size
+            return Seg(type="file", data=payload)
         return Seg(type="text", data=content)
+
+    def _chat_record_media_segments(self, nodes):
+        """把合并聊天记录中已恢复的图片和表情追加为原生媒体段。"""
+
+        if not isinstance(nodes, list):
+            return []
+        media_root = Path(IMAGE_SAVE_DIR).resolve()
+        segments = []
+        seen = set()
+
+        def walk(items, depth=0):
+            if depth > 4 or len(segments) >= 12:
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                local_path = self._text(item.get("localPath"))
+                media_type = self._text(item.get("localMediaType")).casefold()
+                if local_path and media_type in {"image", "emoji"}:
+                    try:
+                        source = Path(local_path).resolve(strict=True)
+                        if not source.is_relative_to(media_root):
+                            raise ValueError("合并记录媒体路径超出 WeMai 媒体目录")
+                        key = os.path.normcase(os.fspath(source))
+                        if key not in seen:
+                            converted = self._inbound_segment(source, media_type)
+                            if converted.type in {"image", "emoji"}:
+                                seen.add(key)
+                                segments.append(converted)
+                    except (OSError, ValueError) as exc:
+                        logger.warning(
+                            "读取合并聊天记录媒体失败 path=%s: %s",
+                            local_path,
+                            exc,
+                        )
+                nested = item.get("chatRecordList")
+                if isinstance(nested, list):
+                    walk(nested, depth + 1)
+                if len(segments) >= 12:
+                    return
+
+        walk(nodes)
+        return segments
 
     @staticmethod
     def _build_user_info(*, platform, user_id, user_nickname, user_cardname):
@@ -2162,22 +2532,22 @@ class MessageProcessor:
         return (width, height), fingerprint
 
     @classmethod
-    def _is_weflow_unavailable_avatar(cls, raw):
-        """识别 WeFlow 的“暂时无法查看”头像，不把占位图绑定给真实用户。"""
+    def _is_unavailable_avatar(cls, raw):
+        """识别微信“暂时无法查看”头像，不把占位图绑定给真实用户。"""
         try:
             (width, height), fingerprint = cls._avatar_difference_hash(raw)
         except Exception:
             # 图片头已经在下载阶段校验；识别器异常时保持原有兼容行为。
-            logger.debug("WeFlow 头像占位图识别失败", exc_info=True)
+            logger.debug("微信头像占位图识别失败", exc_info=True)
             return False
         if width != height or not (
-            _WEFLOW_UNAVAILABLE_AVATAR_MIN_SIZE
+            _UNAVAILABLE_AVATAR_MIN_SIZE
             <= width
-            <= _WEFLOW_UNAVAILABLE_AVATAR_MAX_SIZE
+            <= _UNAVAILABLE_AVATAR_MAX_SIZE
         ):
             return False
-        distance = (fingerprint ^ _WEFLOW_UNAVAILABLE_AVATAR_DHASH).bit_count()
-        return distance <= _WEFLOW_UNAVAILABLE_AVATAR_MAX_HASH_DISTANCE
+        distance = (fingerprint ^ _UNAVAILABLE_AVATAR_DHASH).bit_count()
+        return distance <= _UNAVAILABLE_AVATAR_MAX_HASH_DISTANCE
 
     def _discard_cached_unavailable_avatar(self, targets):
         """删除已经落盘的同类占位图；任何非占位头像都原样保留。"""
@@ -2188,7 +2558,7 @@ class MessageProcessor:
                 if not old_path.is_file():
                     continue
                 try:
-                    is_placeholder = self._is_weflow_unavailable_avatar(
+                    is_placeholder = self._is_unavailable_avatar(
                         old_path.read_bytes()
                     )
                 except OSError:
@@ -2210,7 +2580,7 @@ class MessageProcessor:
         *,
         target_type="user",
     ):
-        """Download one WeFlow avatar into MaiBot's filesystem cache."""
+        """把微信头像下载到 MaiBot 文件缓存。"""
         if target_type == "group":
             targets = self._group_avatar_paths(group_id)
             target_label = f"group:{group_id}"
@@ -2221,10 +2591,10 @@ class MessageProcessor:
             return False
         try:
             raw, suffix = self._download_avatar(avatar_url)
-            if self._is_weflow_unavailable_avatar(raw):
+            if self._is_unavailable_avatar(raw):
                 removed = self._discard_cached_unavailable_avatar(targets)
                 logger.info(
-                    "忽略 WeFlow 暂不可用头像 user_id=%s removed_stale=%d",
+                    "忽略微信暂不可用头像 user_id=%s removed_stale=%d",
                     target_label,
                     removed,
                 )
@@ -2349,6 +2719,20 @@ class MessageProcessor:
         value = f"{self.platform}|{chat_type}|{identifier}"
         return hashlib.md5(value.encode("utf-8"), usedforsecurity=False).hexdigest()
 
+    def resolve_sender_alias(self, chat_id, *display_names):
+        """从内存中恢复群成员真 ID；歧义或未命中时返回空字符串。"""
+        aliases = getattr(self, "_sender_aliases", None)
+        if aliases is None:
+            return ""
+        return aliases.resolve(chat_id, *display_names)
+
+    def observe_sender_alias(self, chat_id, sender_wxid, *display_names):
+        """异步持久化由微信本地数据库确认的群成员名称。"""
+        aliases = getattr(self, "_sender_aliases", None)
+        if aliases is None:
+            return 0
+        return aliases.observe(chat_id, sender_wxid, *display_names)
+
     def _remember(self, identifier, name, chat_type):
         with self._id_lock:
             self._id_to_name[identifier] = {"name": name, "type": chat_type, "updated": time.time()}
@@ -2370,29 +2754,50 @@ class MessageProcessor:
             candidates.extend((getattr(receiver, "group_info", None),
                                getattr(receiver, "user_info", None)))
         candidates.extend((getattr(info, "group_info", None), getattr(info, "user_info", None)))
-        bot_id = self._stable_id("bot", WEMAI_BOT_NICKNAME or "self")
+        platform_account_id = self._text(
+            getattr(self, "_platform_account_id", "")
+        )
+        bot_ids = {
+            self._stable_id("bot", WEMAI_BOT_NICKNAME or "self"),
+            platform_account_id,
+        } - {""}
         bot_names = {"WeMai", WEMAI_BOT_NICKNAME} - {""}
         # 只有稳定 ID 可作为权威路由依据，昵称不作为路由键。
         for value in candidates:
             if not value:
                 continue
             identifier = getattr(value, "group_id", None) or getattr(value, "user_id", None)
-            if identifier and identifier != bot_id:
+            if identifier and identifier not in bot_ids:
                 mapped = self._id_to_name.get(identifier)
                 if mapped:
                     name = mapped["name"] if isinstance(mapped, dict) else mapped
                     if name not in bot_names:
                         return name
         config = getattr(info, "additional_config", None)
-        target = None
         if config:
-            if isinstance(config, dict):
-                target = config.get("platform_io_target_user_id")
-            else:
-                target = getattr(config, "platform_io_target_user_id", None)
-        mapped = self._id_to_name.get(target) if target and target != bot_id else None
-        name = (mapped.get("name") if isinstance(mapped, dict) else mapped) if mapped else None
-        return name if name and name not in bot_names else None
+            # MaiBot normally echoes the destination through receiver_info.
+            # Keep the native-ID metadata as a complete fallback for both
+            # group and private replies, matching the inbound fields above.
+            for key in (
+                "platform_io_target_group_id",
+                "platform_io_target_user_id",
+            ):
+                if isinstance(config, dict):
+                    target = config.get(key)
+                else:
+                    target = getattr(config, key, None)
+                target = self._text(target)
+                if not target or target in bot_ids:
+                    continue
+                mapped = self._id_to_name.get(target)
+                name = (
+                    mapped.get("name")
+                    if isinstance(mapped, dict)
+                    else mapped
+                ) if mapped else None
+                if name and name not in bot_names:
+                    return name
+        return None
 
     def _load_id_map(self):
         # 从旧版 {id: name|record} JSON 文件执行一次性迁移。

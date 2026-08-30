@@ -8,12 +8,12 @@ from importlib import metadata
 
 REQUIREMENTS = (
     ("wx4py", "wx4py", "0.2.1"),
-    ("Pillow", "PIL", None),
-    ("pyperclip", "pyperclip", None),
-    ("websockets", "websockets", None),
+    ("Pillow", "PIL", "12.3.0"),
+    ("pyperclip", "pyperclip", "1.11.0"),
+    ("websockets", "websockets", "16.1.1"),
     ("maim-message", "maim_message", "0.6.8"),
-    ("aiofiles", "aiofiles", None),
-    ("python-dotenv", "dotenv", None),
+    ("aiofiles", "aiofiles", "25.1.0"),
+    ("python-dotenv", "dotenv", "1.2.2"),
 )
 
 
@@ -43,4 +43,3 @@ def check_dependencies() -> list[dict[str, str]]:
 
 if __name__ == "__main__":
     print(json.dumps(check_dependencies(), ensure_ascii=False))
-

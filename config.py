@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 # WeMai 统一管理日志；阻止底层 wx4py 在工作目录额外创建 wx4py.log。
@@ -55,13 +56,51 @@ def _parse_bool(value: Optional[str], default: bool = False) -> bool:
         return False
     raise ValueError(f"布尔配置值无效: {value!r}")
 
-# WeFlow 自己负责黑白名单，WeMai 不再维护第二份聊天过滤配置。
+def _parse_filter_list(value: Optional[str]) -> list[str]:
+    """解析会话黑白名单；支持 JSON 数组、换行或逗号分隔。"""
+    if not value:
+        return []
+    if value.lstrip().startswith("["):
+        parsed = json.loads(value)
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ValueError("入站黑白名单 JSON 必须是字符串数组")
+        source = parsed
+    else:
+        source = re.split(r"[\r\n,]+", value)
+    return list(dict.fromkeys(item.strip() for item in source if item.strip()))
+
+
+# 微信会话ID最稳定，也允许填写当前显示名称。黑名单优先于白名单；
+# 白名单为空时默认接收全部会话。过滤在媒体解密前执行，不增加放行消息的网络延迟。
+LOCAL_INBOUND_ALLOWLIST = _parse_filter_list(os.getenv("LOCAL_INBOUND_ALLOWLIST"))
+LOCAL_INBOUND_BLOCKLIST = _parse_filter_list(os.getenv("LOCAL_INBOUND_BLOCKLIST"))
+
+# UI 入站已经停用；保留空列表供旧调用兼容。
 WX_TARGET_CHATS = []
 
-# WeFlow HTTP API 配置。Token 在服务启动时校验。
-WEFLOW_API_URL = os.getenv('WEFLOW_API_URL', 'http://127.0.0.1:5031').strip().rstrip('/')
-WEFLOW_API_TOKEN = os.getenv('WEFLOW_API_TOKEN', '').strip()
-WEFLOW_PUSH_ENABLED = True
+# 入站直接只读微信数据库，不依赖外部推送进程或网络端口。
+_wemai_root = os.path.dirname(os.path.abspath(__file__))
+LOCAL_INBOUND_DIR = os.path.abspath(os.path.expanduser(os.getenv(
+    'LOCAL_INBOUND_DIR', os.path.join(_wemai_root, 'local_inbound')
+)))
+LOCAL_INBOUND_NODE = os.path.abspath(os.path.expanduser(os.getenv(
+    'LOCAL_INBOUND_NODE', os.path.join(LOCAL_INBOUND_DIR, 'runtime', 'node.exe')
+)))
+LOCAL_INBOUND_SCRIPT = os.path.abspath(os.path.expanduser(os.getenv(
+    'LOCAL_INBOUND_SCRIPT', os.path.join(LOCAL_INBOUND_DIR, 'local-inbound.js')
+)))
+LOCAL_INBOUND_CREDENTIALS_FILE = os.path.abspath(os.path.expanduser(os.getenv(
+    'LOCAL_INBOUND_CREDENTIALS_FILE',
+    os.path.join(_wemai_root, 'data', 'local_inbound_credentials.json'),
+)))
+LOCAL_INBOUND_STATE_FILE = os.path.abspath(os.path.expanduser(os.getenv(
+    'LOCAL_INBOUND_STATE_FILE',
+    os.path.join(_wemai_root, 'data', 'local_inbound_state.json'),
+)))
+LOCAL_INBOUND_NATIVE_IMAGE_ADDON = os.path.abspath(os.path.expanduser(os.getenv(
+    'LOCAL_INBOUND_NATIVE_IMAGE_ADDON',
+    os.path.join(LOCAL_INBOUND_DIR, 'vendor', 'weflow-image-native-win32-x64.node'),
+)))
 
 # 独立窗口只在第一次发送时打开，此后一直复用绑定的 HWND。
 WX_OPEN_WINDOWS_ON_DEMAND = True
@@ -70,6 +109,7 @@ WX_OPEN_WINDOWS_ON_DEMAND = True
 # 新版麦麦用 maim_message 库的纯 WebSocket 服务，默认端口 8000，路径 /ws。
 # 端口对应 bot_config.toml 里 [maim_message].ws_server_port（默认 8000）。
 MAIBOT_API_URL = os.getenv('MAIBOT_API_URL', 'ws://127.0.0.1:8000/ws')
+MAIBOT_API_TOKEN = os.getenv('MAIBOT_API_TOKEN', '').strip()
 _maibot_data_dir = os.getenv('MAIBOT_DATA_DIR', '').strip()
 MAIBOT_DATA_DIR = (
     os.path.abspath(os.path.expanduser(_maibot_data_dir))
@@ -180,19 +220,6 @@ WEBUI_HOST = os.getenv('WEBUI_HOST', '127.0.0.1').strip()
 WEBUI_PORT = _bounded_int('WEBUI_PORT', 8888, 65535)
 WEBUI_PASSWORD = os.getenv('WEBUI_PASSWORD', '')
 
-# 高级管理扩展默认关闭；全部关闭时不会启动 WeChatAuto.SDK 或加载 OCR。
-OPTIONAL_CONTACTS_ENABLED = _parse_bool(
-    os.getenv('OPTIONAL_CONTACTS_ENABLED'), False
-)
-OPTIONAL_GROUPS_ENABLED = _parse_bool(
-    os.getenv('OPTIONAL_GROUPS_ENABLED'), False
-)
-OPTIONAL_FEATURES_ENABLED = any((
-    OPTIONAL_CONTACTS_ENABLED,
-    OPTIONAL_GROUPS_ENABLED,
-))
-OPTIONAL_HOST_PORT = _bounded_int('OPTIONAL_HOST_PORT', 5088, 65535)
-
 # 0 表示等待所有初始目标处理完成，不按累计耗时误杀 UI worker。
 UI_WORKER_STARTUP_TIMEOUT_SECONDS = _nonnegative_float(
     'UI_WORKER_STARTUP_TIMEOUT_SECONDS', 0.0
@@ -220,10 +247,19 @@ LOCAL_FILE_DELIVERY_ROOT = (
 MEDIA_DOWNLOAD_TIMEOUT_SECONDS = _bounded_int('MEDIA_DOWNLOAD_TIMEOUT_SECONDS', 15, 120)
 MEDIA_DOWNLOAD_MAX_REDIRECTS = _bounded_int('MEDIA_DOWNLOAD_MAX_REDIRECTS', 3, 10)
 SEND_QUEUE_SIZE = _bounded_int('SEND_QUEUE_SIZE', 100, 100000)
-# WeFlow SSE 接收线程只负责读流；解析线程按 sessionId 串行化同一会话，
-# 不同会话最多并发 8 路。上限 32 避免错误配置创建过多线程。
-WEFLOW_DISPATCH_WORKERS = _bounded_int(
-    'WEFLOW_DISPATCH_WORKERS', 8, 32
+# 本地数据库解析按 sessionId 串行化同一会话，不同会话最多并发 8 路。
+# 上限 32 避免错误配置创建过多线程。
+LOCAL_INBOUND_DISPATCH_WORKERS = _bounded_int(
+    'LOCAL_INBOUND_DISPATCH_WORKERS', 8, 32
+)
+LOCAL_INBOUND_POLL_INTERVAL_MS = _bounded_int(
+    'LOCAL_INBOUND_POLL_INTERVAL_MS', 250, 60000
+)
+LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS = _positive_float(
+    'LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS', 30.0
+)
+LOCAL_INBOUND_MEDIA_WAIT_SECONDS = _bounded_int(
+    'LOCAL_INBOUND_MEDIA_WAIT_SECONDS', 120, 600
 )
 # 微信入站最终投递到 MaiBot 时，同一会话严格串行，不同会话并发。
 # 默认 8 足以消除单循环排队，同时避免瞬时突发压垮 MaiBot WebSocket。
@@ -248,13 +284,13 @@ EXIT_LOG_MAX_BYTES = _bounded_int('EXIT_LOG_MAX_BYTES', 1024 * 1024, 200 * 1024 
 EXIT_LOG_BACKUP_COUNT = _bounded_int('EXIT_LOG_BACKUP_COUNT', 3, 100)
 
 # Long-running housekeeping. Defaults are tuned for a ~1 TB disk where
-# plenty of headroom is available: weflow temp files are GC'd after
+# plenty of headroom is available: local inbound temp files are GC'd after
 # 30 days (they are internals; useful for forensic replay within a
 # month, wasted beyond that), and user-visible 微信图片_* previews
 # are kept for 6 months by default. Either value may be set to 0 to
 # disable the corresponding sweep entirely. Upper bound is 3650
 # (10 years) for explicit long-retention deployments.
-IMAGE_TEMP_PREFIX = "weflow_"
+IMAGE_TEMP_PREFIX = "local_"
 IMAGE_PERSISTED_PREFIX = "微信图片_"
 IMAGE_TEMP_RETENTION_DAYS = _retention_days('IMAGE_TEMP_RETENTION_DAYS', 30, 3650)
 IMAGE_PERSISTED_RETENTION_DAYS = _retention_days('IMAGE_PERSISTED_RETENTION_DAYS', 180, 3650)
@@ -279,8 +315,6 @@ if not (_webui_address.is_loopback or _webui_address.is_unspecified) and not WEB
     raise ValueError("WebUI 监听非本机地址时必须设置 WEBUI_PASSWORD")
 if _webui_address.is_unspecified and not WEBUI_PASSWORD:
     raise ValueError("WebUI 监听 0.0.0.0 时必须设置 WEBUI_PASSWORD")
-if OPTIONAL_HOST_PORT == WEBUI_PORT:
-    raise ValueError("OPTIONAL_HOST_PORT 不能与 WEBUI_PORT 相同")
 if UI_WORKER_BUSY_TIMEOUT_SECONDS < UI_WORKER_IDLE_TIMEOUT_SECONDS:
     raise ValueError(
         "UI_WORKER_BUSY_TIMEOUT_SECONDS 不能小于 "
@@ -292,22 +326,23 @@ def print_config_info():
     """打印当前加载的配置信息"""
     logger = logging.getLogger(__name__)
     logger.info("\n=== WeMai 配置信息 ===")
-    logger.info("微信会话: 由 WeFlow 黑白名单决定，首次发送时按需打开独立窗口")
-    logger.info(
-        "WeFlow: push_enabled=%s api_url=%s token_configured=%s",
-        WEFLOW_PUSH_ENABLED,
-        WEFLOW_API_URL,
-        bool(WEFLOW_API_TOKEN),
-    )
+    logger.info("微信会话: 全部接收入站，首次发送时按需打开独立窗口")
+    logger.info("微信入站后端: 本地数据库只读 sidecar")
     logger.info(f"MaiBot API URL: {MAIBOT_API_URL}")
     logger.info(f"MaiBot 数据目录: {MAIBOT_DATA_DIR or '<未配置>'}")
     logger.info(
-        "WeFlow 入站解析: 同会话串行，不同会话并发上限=%d",
-        WEFLOW_DISPATCH_WORKERS,
+        "本地数据库入站: 同会话串行，不同会话并发上限=%d poll=%dms",
+        LOCAL_INBOUND_DISPATCH_WORKERS,
+        LOCAL_INBOUND_POLL_INTERVAL_MS,
     )
     logger.info(
         "MaiBot 入站投递: 同会话串行，不同会话并发上限=%d",
         INBOUND_ROUTER_CONCURRENCY,
+    )
+    logger.info(
+        "入站会话过滤: 白名单=%d 黑名单=%d（黑名单优先）",
+        len(LOCAL_INBOUND_ALLOWLIST),
+        len(LOCAL_INBOUND_BLOCKLIST),
     )
     logger.info(f"日志级别: {LOG_LEVEL}")
     logger.info(f"平台标识: {PLATFORM_ID}")
@@ -316,11 +351,6 @@ def print_config_info():
         WEBUI_HOST,
         WEBUI_PORT,
         "需要密码" if WEBUI_PASSWORD else "仅本机访问",
-    )
-    logger.info(
-        "OCR 高级扩展: 联系人=%s 群管理=%s",
-        OPTIONAL_CONTACTS_ENABLED,
-        OPTIONAL_GROUPS_ENABLED,
     )
     logger.info(
         "WeMai UI: tick=%s batch_size=%s tail_size=%s "

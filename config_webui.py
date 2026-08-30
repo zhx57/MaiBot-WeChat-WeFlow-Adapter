@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import ipaddress
 import json
 import os
 import re
 import secrets
+import subprocess
 import threading
+import time
+from collections.abc import Callable
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
+from local_inbound_credentials import CredentialError, load_credentials, save_credentials
+from wechat_key_bootstrap import WechatKeyError
+
 DEFAULTS = {
-    "WEFLOW_API_URL": "http://127.0.0.1:5031",
-    "WEFLOW_API_TOKEN": "",
-    "WEFLOW_DISPATCH_WORKERS": "8",
+    "LOCAL_INBOUND_DISPATCH_WORKERS": "8",
+    "LOCAL_INBOUND_POLL_INTERVAL_MS": "250",
+    "LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS": "30",
+    "LOCAL_INBOUND_MEDIA_WAIT_SECONDS": "120",
+    "LOCAL_INBOUND_ALLOWLIST": "",
+    "LOCAL_INBOUND_BLOCKLIST": "",
     "MAIBOT_API_URL": "ws://127.0.0.1:8000/ws",
     "MAIBOT_DATA_DIR": "",
     "INBOUND_ROUTER_CONCURRENCY": "8",
@@ -31,21 +40,44 @@ DEFAULTS = {
     "WEBUI_HOST": "127.0.0.1",
     "WEBUI_PORT": "8888",
     "WEBUI_PASSWORD": "",
-    "OPTIONAL_CONTACTS_ENABLED": "false",
-    "OPTIONAL_GROUPS_ENABLED": "false",
 }
 
 EDITABLE_KEYS = tuple(DEFAULTS)
-SECRET_KEYS = {"WEFLOW_API_TOKEN", "WEBUI_PASSWORD"}
-BOOL_KEYS = {
-    "OPTIONAL_CONTACTS_ENABLED",
-    "OPTIONAL_GROUPS_ENABLED",
-}
+SECRET_KEYS = {"WEBUI_PASSWORD"}
+BOOL_KEYS = set()
+LIST_KEYS = {"LOCAL_INBOUND_ALLOWLIST", "LOCAL_INBOUND_BLOCKLIST"}
 BOUNDED_INT_KEYS = {
-    "WEFLOW_DISPATCH_WORKERS": (1, 32, "WeFlow 入站解析并发"),
+    "LOCAL_INBOUND_DISPATCH_WORKERS": (1, 32, "本地入站解析并发"),
+    "LOCAL_INBOUND_POLL_INTERVAL_MS": (100, 60000, "本地入站轮询间隔"),
+    "LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS": (1, 300, "本地入站启动超时"),
+    "LOCAL_INBOUND_MEDIA_WAIT_SECONDS": (1, 600, "入站媒体等待时间"),
     "INBOUND_ROUTER_CONCURRENCY": (1, 32, "MaiBot 入站投递并发"),
 }
 _ENV_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_MANDATORY_SYSTEM_ENTRIES = {
+    "gh_*",
+    "brandsessionholder",
+    "filehelper",
+    "floatbottle",
+    "fmessage",
+    "medianote",
+    "newsapp",
+    "notification_messages",
+    "qmessage",
+    "qqmail",
+    "weixin",
+    "weixinreminder",
+    "wxpay",
+}
+
+
+def _is_mandatory_system_entry(value: object) -> bool:
+    normalized = str(value or "").strip().casefold()
+    return (
+        normalized.startswith("gh_")
+        or "@kefu.openim" in normalized
+        or normalized in _MANDATORY_SYSTEM_ENTRIES
+    )
 
 
 def _parse_bool_value(value: object) -> bool:
@@ -86,7 +118,6 @@ def read_env_file(path: os.PathLike[str] | str) -> dict[str, str]:
             values[match.group(1)] = _decode_env_value(match.group(2))
     if not values["WEMAI_BOT_NICKNAME"]:
         values["WEMAI_BOT_NICKNAME"] = values.get("WX_BOT_NICKNAME", "")
-    # 旧版曾把内部 UI 依赖名写成平台名；读取时直接迁移，避免继续产生旧身份。
     values["PLATFORM_ID"] = "wx"
     return values
 
@@ -135,12 +166,28 @@ def validate_updates(payload: object, current: dict[str, str]) -> dict[str, str]
         value = payload[key]
         if key in BOOL_KEYS:
             updates[key] = "true" if _parse_bool_value(value) else "false"
+        elif key in LIST_KEYS:
+            if not isinstance(value, str):
+                raise ValueError(f"{key} 必须是文本")
+            entries = []
+            seen = set()
+            for item in re.split(r"[\r\n,]+", value):
+                item = item.strip()
+                folded = item.casefold()
+                if item and folded not in seen:
+                    seen.add(folded)
+                    entries.append(item)
+            if len(entries) > 1000:
+                raise ValueError("单个入站名单最多 1000 项")
+            updates[key] = "\n".join(entries)
         elif isinstance(value, (str, int)):
             updates[key] = str(value).strip()
         else:
             raise ValueError(f"{key} 的值无效")
 
     merged = {**current, **updates}
+    if merged["LOCAL_INBOUND_ALLOWLIST"] and merged["LOCAL_INBOUND_BLOCKLIST"]:
+        raise ValueError("入站白名单和黑名单不能同时启用")
     if merged["PLATFORM_ID"].strip().lower() != "wx":
         raise ValueError("MaiBot 平台标识固定为 wx")
     host = merged["WEBUI_HOST"].strip()
@@ -159,9 +206,9 @@ def validate_updates(payload: object, current: dict[str, str]) -> dict[str, str]
     try:
         file_max_bytes = int(merged["FILE_MAX_BYTES"])
     except ValueError as exc:
-        raise ValueError("普通文件上限必须是整数") from exc
+        raise ValueError("普通文件上限必须是有效的 MB 数值") from exc
     if not 1 <= file_max_bytes <= 200 * 1024 * 1024:
-        raise ValueError("普通文件上限必须在 1 到 209715200 字节之间")
+        raise ValueError("普通文件上限必须在 1 字节到 200 MB 之间")
     for key, (minimum, maximum, label) in BOUNDED_INT_KEYS.items():
         try:
             value = int(merged[key])
@@ -173,11 +220,96 @@ def validate_updates(payload: object, current: dict[str, str]) -> dict[str, str]
         raise ValueError("监听 0.0.0.0 或局域网地址时必须设置访问密码")
     if merged["LOG_LEVEL"].upper() not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ValueError("日志级别无效")
-    if not merged["WEFLOW_API_URL"].startswith(("http://", "https://")):
-        raise ValueError("WeFlow 地址必须以 http:// 或 https:// 开头")
     if not merged["MAIBOT_API_URL"].startswith(("ws://", "wss://")):
         raise ValueError("MaiBot 地址必须以 ws:// 或 wss:// 开头")
     return updates
+
+
+def _load_local_contact_options(
+    credentials_path: os.PathLike[str] | str | None,
+    node_path: os.PathLike[str] | str | None,
+    helper_path: os.PathLike[str] | str | None,
+) -> list[dict[str, object]]:
+    """通过一次性只读 Node helper 解密读取微信完整通讯录。"""
+
+    if not credentials_path or not node_path or not helper_path:
+        return []
+    try:
+        credentials = load_credentials(credentials_path)
+        node = Path(node_path)
+        helper = Path(helper_path)
+        if not node.is_file() or not helper.is_file():
+            return []
+        payload = json.dumps(
+            {
+                "accountDir": credentials["account_dir"],
+                "wxid": credentials["wxid"],
+                "dbKeyHex": credentials["db_key"],
+            },
+            ensure_ascii=False,
+        )
+        completed = subprocess.run(
+            [str(node), str(helper)],
+            input=payload,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=8,
+            cwd=str(helper.parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if completed.returncode != 0:
+            return []
+        result = json.loads(completed.stdout.strip() or "{}")
+        rows = result.get("conversations")
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+    except (CredentialError, OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        return []
+
+
+def load_conversation_options(
+    database_path: os.PathLike[str] | str,
+    *,
+    credentials_path: os.PathLike[str] | str | None = None,
+    node_path: os.PathLike[str] | str | None = None,
+    helper_path: os.PathLike[str] | str | None = None,
+) -> list[dict[str, object]]:
+    """只读取微信本地通讯录好友和仍在群内的群聊。"""
+
+    del database_path  # 历史 WeMai/MaiBot 映射不属于通讯录候选来源。
+    options: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def append_option(raw: object) -> None:
+        if not isinstance(raw, dict):
+            return
+        identifier = str(raw.get("id") or raw.get("identifier") or "").strip()
+        if (
+            not identifier
+            or identifier.casefold() in seen
+            or _is_mandatory_system_entry(identifier)
+        ):
+            return
+        name = str(raw.get("name") or identifier).strip() or identifier
+        normalized_id = identifier.casefold()
+        normalized_type = str(raw.get("type") or "").strip().casefold()
+        if normalized_type not in {"private", "group"}:
+            return
+        seen.add(normalized_id)
+        try:
+            updated = float(raw.get("updated") or 0)
+        except (TypeError, ValueError):
+            updated = 0.0
+        options.append({"id": identifier, "name": name, "type": normalized_type, "updated": updated})
+
+    # 候选只来自微信 contact.db；helper 已按好友和在群状态过滤。
+    for row in _load_local_contact_options(credentials_path, node_path, helper_path):
+        append_option(row)
+    return options
 HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -233,12 +365,28 @@ body{margin:0;color:#1a3040;font:14px/1.6 -apple-system,"Segoe UI","Microsoft Ya
 label{display:block;font-weight:600;font-size:13px;margin-bottom:5px;color:#1d4b63}
 .hint{display:block;color:#7899ac;font-size:11.5px;margin-top:4px;line-height:1.4;min-height:16px}
 .hint.configured{color:#187a58;font-weight:600}
-input,select{width:100%;height:38px;border:1.5px solid rgba(154,201,226,.4);border-radius:7px;background:rgba(255,255,255,.85);padding:0 11px;color:#1a3040;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
+input,select,textarea{width:100%;height:38px;border:1.5px solid rgba(154,201,226,.4);border-radius:7px;background:rgba(255,255,255,.85);padding:0 11px;color:#1a3040;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
+textarea{height:88px;padding:9px 11px;resize:vertical;line-height:1.5}
 input::placeholder{color:#a6bfce}
-input:hover,select:hover{border-color:rgba(22,139,195,.45)}
-input:focus,select:focus{border-color:#168bc3;background:#fff;box-shadow:0 0 0 3px rgba(22,139,195,.1)}
+input:hover,select:hover,textarea:hover{border-color:rgba(22,139,195,.45)}
+input:focus,select:focus,textarea:focus{border-color:#168bc3;background:#fff;box-shadow:0 0 0 3px rgba(22,139,195,.1)}
 input[readonly]{background:rgba(200,220,235,.15);color:#608094;cursor:default}
 select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2712%27 height=%2712%27 viewBox=%270 0 24 24%27 fill=%27none%27 stroke=%27%23608094%27 stroke-width=%272%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27%3E%3Cpath d=%27m6 9 6 6 6-6%27/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:30px}
+.segmented{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:4px;border-radius:8px;background:rgba(22,139,195,.07);border:1px solid rgba(22,139,195,.12)}
+.segmented label{margin:0;cursor:pointer;text-align:center;padding:6px 8px;border-radius:6px;color:#608094;font-size:12px;transition:all .15s}
+.segmented input{position:absolute;opacity:0;pointer-events:none;width:1px;height:1px}
+.segmented label:has(input:checked){background:#fff;color:#08658f;box-shadow:0 1px 4px rgba(22,139,195,.15);font-weight:650}
+.conversation-picker{display:flex;flex-direction:column;gap:7px}
+.conversation-list{height:164px;overflow:auto;padding:6px;background:rgba(255,255,255,.72);border:1px solid rgba(154,201,226,.35);border-radius:7px}
+.conversation-option{display:flex;align-items:center;gap:8px;width:100%;min-height:34px;padding:6px 8px;border:1px solid transparent;border-radius:5px;background:transparent;color:#365d70;text-align:left;cursor:pointer;font:inherit;transition:background .14s,border-color .14s,color .14s}
+.conversation-option:hover{background:rgba(22,139,195,.08);border-color:rgba(22,139,195,.2)}
+.conversation-option.selected{background:#168bc3;border-color:#0d719f;color:#fff;box-shadow:0 1px 3px rgba(22,139,195,.2)}
+.conversation-option .checkmark{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px;flex:none;border:1px solid #9ac9df;border-radius:4px;background:#fff;color:transparent;font-size:12px;font-weight:700}
+.conversation-option.selected .checkmark{border-color:#fff;background:#fff;color:#168bc3}
+.conversation-option .conversation-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conversation-option .conversation-id{margin-left:auto;max-width:48%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.72;font-size:11px}
+.conversation-option.selected .conversation-id{opacity:.9}
+.filter-disabled{opacity:.5;pointer-events:none}
 .warning{display:none;margin:0 18px 16px;padding:10px 14px;border-radius:7px;border-left:3px solid #e8a531;background:rgba(255,248,230,.85);color:#7a5418;font-size:12.5px;line-height:1.5}
 .actions{display:flex;align-items:center;gap:10px;padding:16px 18px;border-top:1px solid rgba(154,201,226,.2)}
 .actions .spacer{flex:1}
@@ -285,7 +433,7 @@ button svg{width:15px;height:15px}
   .card-header{padding:11px 14px}
   .actions{flex-wrap:wrap;padding:12px 14px}
   .actions .spacer{display:none}
-  button{flex:1;min-width:0;justify-content:center}
+  .actions button{flex:1 1 calc(50% - 6px);min-width:110px;justify-content:center}
   .toast-container{left:12px;right:12px;bottom:12px}
   .toast{max-width:none}
   input,select,button{font-size:15px}
@@ -331,15 +479,33 @@ button svg{width:15px;height:15px}
         <form id="form">
           <div class="cards">
             <div class="card">
+              <div class="card-header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>微信数据库解密</div>
+              <div class="fields">
+                <div class="field wide"><label>微信账号目录</label><input id="credentialAccountDir" autocomplete="off"><span class="hint">填写包含 db_storage 的账号目录</span></div>
+                <div class="field wide"><label>当前账号ID（wxid）</label><input id="credentialWxid" autocomplete="off"></div>
+                <div class="field wide"><label>64 位十六进制数据库密钥</label><input id="credentialDatabaseKey" type="text" autocomplete="off" spellcheck="false"><span class="hint">密钥会显示在本机 WebUI，并通过 Windows DPAPI 加密保存</span></div>
+                <div class="field"><label>图片 XOR 密钥</label><input id="credentialImageXorKey" type="password" autocomplete="new-password"><span class="hint">用于入站图片解密，留空保持现值</span></div>
+                <div class="field"><label>图片 AES 密钥</label><input id="credentialImageAesKey" type="password" autocomplete="new-password"><span class="hint">用于入站图片解密，留空保持现值</span></div>
+                <div class="field wide"><span id="credentialStatus" class="hint">正在检查数据库凭据</span></div>
+                <div class="field wide"><label>首次自动获取</label><select id="wechatAccountSelect" disabled><option value="">正在检测微信登录状态</option></select><span id="wechatKeyStatus" class="hint">请先启动并登录电脑版微信</span></div>
+              </div>
+              <div class="actions"><button id="acquireWechatKey" type="button">自动获取密钥</button><div class="spacer"></div><button id="saveCredentials" type="button" class="primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>保存数据库凭据</button></div>
+            </div>
+            <div class="card">
               <div class="card-header"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>服务连接</div>
               <div class="fields">
-                <div class="field wide"><label>WeFlow API</label><input name="WEFLOW_API_URL" autocomplete="url"></div>
-                <div class="field wide"><label>WeFlow Token</label><input name="WEFLOW_API_TOKEN" type="password" autocomplete="new-password"><span id="tokenHint" class="hint"></span></div>
-                <div class="field"><label>WeFlow 入站解析并发</label><input name="WEFLOW_DISPATCH_WORKERS" inputmode="numeric"><span class="hint">同一会话串行，不同会话默认最多 8 路</span></div>
+                <div class="field"><label>本地入站解析并发</label><input name="LOCAL_INBOUND_DISPATCH_WORKERS" inputmode="numeric"><span class="hint">同一会话串行，不同会话默认最多 8 路</span></div>
                 <div class="field"><label>MaiBot 入站投递并发</label><input name="INBOUND_ROUTER_CONCURRENCY" inputmode="numeric"><span class="hint">与解析并发保持一致，建议使用 8</span></div>
+                <div class="field"><label>数据库保险轮询（毫秒）</label><input name="LOCAL_INBOUND_POLL_INTERVAL_MS" inputmode="numeric"><span class="hint">文件变更会立即触发，250 毫秒仅用于防漏</span></div>
+                <div class="field"><label>入站启动超时（秒）</label><input name="LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS" inputmode="numeric"><span class="hint">数据库短暂占用时会自动重试</span></div>
+                <div class="field"><label>媒体等待上限（秒）</label><input name="LOCAL_INBOUND_MEDIA_WAIT_SECONDS" inputmode="numeric"><span class="hint">文件最长等待 120 秒；图片和语音最多等待 10 秒</span></div>
                 <div class="field wide"><label>MaiBot WebSocket</label><input name="MAIBOT_API_URL" autocomplete="url"></div>
                 <div class="field wide"><label>MaiBot data 目录</label><input name="MAIBOT_DATA_DIR"></div>
                 <div class="field wide"><label>MaiBot 平台标识</label><input name="PLATFORM_ID" value="wx" readonly><span class="hint">WeMai 与 MaiBot 两端必须一致，固定为 wx</span></div>
+                <div class="field wide"><label>入站名单模式</label><div class="segmented" id="inboundFilterMode"><label><input type="radio" name="inboundFilterMode" value="all" checked>全部会话</label><label><input type="radio" name="inboundFilterMode" value="allow">仅白名单</label><label><input type="radio" name="inboundFilterMode" value="block">排除黑名单</label></div><span class="hint">白名单与黑名单二选一；微信系统用户固定不入站且不显示</span></div>
+                <div class="field wide conversation-picker" id="conversationPicker"><label>选择会话</label><input id="conversationSearch" placeholder="搜索通讯录好友、已添加群聊或微信真 ID"><div id="inboundConversationList" class="conversation-list" role="listbox" aria-label="入站名单会话" aria-multiselectable="true"></div><span class="hint">鼠标单击即可勾选，再次单击取消；列表仅来自微信本地通讯录，与 MaiBot 聊天流和 WeMai 历史映射无关</span></div>
+                <div class="field wide"><label>手动补充会话真 ID</label><textarea id="inboundManualEntries" placeholder="列表中尚未出现的会话可在此填写，每行一个"></textarea><span class="hint">优先填写稳定真 ID；已在上方选择的会话无需重复填写</span></div>
+                <input type="hidden" name="LOCAL_INBOUND_ALLOWLIST"><input type="hidden" name="LOCAL_INBOUND_BLOCKLIST">
               </div>
             </div>
             <div class="card">
@@ -348,7 +514,7 @@ button svg{width:15px;height:15px}
                 <div class="field"><label>机器人微信昵称</label><input name="WEMAI_BOT_NICKNAME"></div>
                 <div class="field"><label>日志级别</label><select name="LOG_LEVEL"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>CRITICAL</option></select></div>
                 <div class="field"><label>媒体保存目录</label><input name="IMAGE_SAVE_DIR"></div>
-                <div class="field"><label>普通文件上限（字节）</label><input name="FILE_MAX_BYTES" inputmode="numeric"><span class="hint">默认 209715200（200 MiB），文件采用磁盘流式保存</span></div>
+                <div class="field"><label>普通文件上限（MB）</label><input name="FILE_MAX_BYTES" inputmode="decimal" type="number" min="0.001" max="200" step="0.001"><span class="hint">默认 200 MB，内部自动换算为字节；文件采用磁盘流式保存</span></div>
               </div>
             </div>
             <div class="card">
@@ -366,6 +532,7 @@ button svg{width:15px;height:15px}
             <button id="start" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>启动</button>
             <button id="stop" class="danger" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>停止</button>
             <button id="restart" class="danger" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>重启</button>
+            <button id="shutdown" class="danger" type="button" title="停止全部服务并关闭 WebUI"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>完全退出</button>
             <button id="save" class="primary" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>保存配置</button>
           </div>
         </form>
@@ -409,13 +576,27 @@ button svg{width:15px;height:15px}
 </div>
 <div class="toast-container" id="toastContainer"></div>
 <script>
-var form=document.querySelector("#form");var toastContainer=document.querySelector("#toastContainer");var configured={};var autoRefreshTimer=null;var allLogLines=[];
+var form=document.querySelector("#form");var toastContainer=document.querySelector("#toastContainer");var configured={};var autoRefreshTimer=null;var allLogLines=[];var conversationOptions=[];var selectedConversationIds=new Set();
 function notify(m,t){t=t||"info";var e=document.createElement("div");e.className="toast "+t;e.textContent=m;toastContainer.appendChild(e);setTimeout(function(){e.style.opacity="0";e.style.transform="translateY(8px)"},3500);setTimeout(function(){e.remove()},3900)}
 function switchPage(p){document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active")});var i=document.querySelector('.nav-item[data-page="'+p+'"]');if(i)i.classList.add("active");document.querySelectorAll(".page-section").forEach(function(s){s.classList.remove("active")});var sec=document.getElementById("page-"+p);if(sec)sec.classList.add("active");if(p==="logs"){loadLogs();startAutoRefresh()}else{stopAutoRefresh()}}
 function updateWarnings(){var h=form.elements.WEBUI_HOST.value.trim();document.querySelector("#networkWarning").style.display=(h!=="127.0.0.1"&&h!=="localhost"&&h!=="::1")?"block":"none"}
 async function api(p,o){o=o||{};var h={"Content-Type":"application/json"};if(o.headers){for(var k in o.headers){h[k]=o.headers[k]}}var r=await fetch(p,{cache:"no-store",method:o.method,body:o.body,headers:h});var d=await r.json().catch(function(){return{}});if(!r.ok)throw new Error(d.error||JSON.stringify(d));return d}
 function secretState(key,hintId,emptyText){var el=form.elements[key],hint=document.querySelector(hintId);var saved=configured.configuredSecrets.indexOf(key)>=0;el.value="";el.placeholder=saved?"已保存（留空表示不修改）":emptyText;hint.textContent=saved?"已保存，留空保持原值":emptyText;if(saved){hint.className="hint configured"}else{hint.className="hint"}}
-async function load(){var d=await api("/api/config?_="+Date.now());configured=d;var ks=Object.keys(d.values);for(var i=0;i<ks.length;i++){var key=ks[i],val=d.values[key];var el=form.elements[key];if(!el)continue;if(d.secrets.indexOf(key)>=0)continue;el.value=val||""}secretState("WEFLOW_API_TOKEN","#tokenHint","尚未配置");secretState("WEBUI_PASSWORD","#passwordHint","本机访问可留空");updateWarnings();await loadStatus()}
+async function loadCredentials(){var d=await api("/api/credentials?_="+Date.now());var a=document.querySelector("#credentialAccountDir"),w=document.querySelector("#credentialWxid"),s=document.querySelector("#credentialStatus");a.value=d.accountDir||"";w.value=d.wxid||"";document.querySelector("#credentialDatabaseKey").value=d.databaseKey||"";document.querySelector("#credentialImageXorKey").value="";document.querySelector("#credentialImageAesKey").value="";s.textContent=d.configured?"凭据有效，账号 "+d.wxid+"；数据库密钥已显示，图片密钥 "+((d.imageXorKeyConfigured&&d.imageAesKeyConfigured)?"完整":"未完整配置"):"尚未配置，请填写后保存";s.className=d.configured?"hint configured":"hint"}
+async function loadWechatKeyStatus(){var s=document.querySelector("#wechatKeyStatus"),q=document.querySelector("#wechatAccountSelect"),b=document.querySelector("#acquireWechatKey");try{var d=await api("/api/wechat-key/status?_="+Date.now());q.innerHTML="";(d.accounts||[]).forEach(function(a){var o=document.createElement("option");o.value=a.id;o.textContent=a.wxid+" — "+a.accountDir;q.appendChild(o)});var ready=d.state==="logged_in"&&d.accounts&&d.accounts.length>0;q.disabled=!ready;b.disabled=!ready;s.textContent=d.state==="not_running"||d.state==="not_logged_in"?"请先启动并登录电脑版微信":ready?"已检测到登录账号，可直接进行只读内存扫描":"微信状态检测失败"}catch(err){q.disabled=true;b.disabled=true;s.textContent=err.message}}
+async function acquireWechatKey(){var b=document.querySelector("#acquireWechatKey"),q=document.querySelector("#wechatAccountSelect"),s=document.querySelector("#wechatKeyStatus");if(!q.value)return notify("请选择微信账号","error");b.disabled=true;s.textContent="正在只读扫描微信内存并验证数据库，请稍候";try{var d=await api("/api/wechat-key/acquire",{method:"POST",body:JSON.stringify({accountId:q.value})});document.querySelector("#credentialAccountDir").value=d.accountDir||"";document.querySelector("#credentialWxid").value=d.wxid||"";document.querySelector("#credentialDatabaseKey").value=d.dbKeyHex||"";s.textContent="密钥获取成功并已通过 DPAPI 保存";notify("数据库密钥获取成功","success");await loadStatus()}catch(err){s.textContent=err.message;notify(err.message,"error")}finally{b.disabled=false}}
+async function saveCredentials(){var b=document.querySelector("#saveCredentials");b.disabled=true;var pl={accountDir:document.querySelector("#credentialAccountDir").value,wxid:document.querySelector("#credentialWxid").value,databaseKey:document.querySelector("#credentialDatabaseKey").value,imageXorKey:document.querySelector("#credentialImageXorKey").value,imageAesKey:document.querySelector("#credentialImageAesKey").value};try{await api("/api/credentials",{method:"POST",body:JSON.stringify(pl)});notify("数据库凭据已加密保存，重启后生效","success");await loadCredentials()}catch(err){notify(err.message,"error")}finally{b.disabled=false}}
+function listEntries(value){return String(value||"").split(/[\r\n,]+/).map(function(v){return v.trim()}).filter(Boolean)}
+function filterMode(){var checked=document.querySelector('input[name="inboundFilterMode"]:checked');return checked?checked.value:"all"}
+function setFilterMode(mode){var target=document.querySelector('input[name="inboundFilterMode"][value="'+mode+'"]');if(target)target.checked=true;updateFilterPicker()}
+function updateFilterPicker(){var disabled=filterMode()==="all";document.querySelector("#conversationPicker").classList.toggle("filter-disabled",disabled);document.querySelector("#inboundManualEntries").disabled=disabled;if(conversationOptions.length)renderConversationOptions()}
+function conversationSortMode(){return filterMode()==="allow"?"selected-first":filterMode()==="block"?"unselected-first":"stable"}
+function sortConversationOptions(items){var mode=conversationSortMode();return items.slice().sort(function(a,b){if(mode!=="stable"){var as=selectedConversationIds.has(a.id)?1:0,bs=selectedConversationIds.has(b.id)?1:0;if(mode==="unselected-first"){as=1-as;bs=1-bs}if(as!==bs)return bs-as}var an=String(a.name||a.id).toLocaleLowerCase(),bn=String(b.name||b.id).toLocaleLowerCase();return an===bn?String(a.id).localeCompare(String(b.id)):an.localeCompare(bn)})}
+function toggleConversation(id){if(selectedConversationIds.has(id))selectedConversationIds.delete(id);else selectedConversationIds.add(id);renderConversationOptions()}
+function selectedConversationEntries(){return sortConversationOptions(conversationOptions).filter(function(item){return selectedConversationIds.has(item.id)}).map(function(item){return item.id})}
+function renderConversationOptions(){var list=document.querySelector("#inboundConversationList"),query=document.querySelector("#conversationSearch").value.trim().toLocaleLowerCase();list.innerHTML="";var items=sortConversationOptions(conversationOptions);for(var i=0;i<items.length;i++){var item=items[i],hay=(item.name+" "+item.id).toLocaleLowerCase();if(query&&hay.indexOf(query)<0&&!selectedConversationIds.has(item.id))continue;var selected=selectedConversationIds.has(item.id),option=document.createElement("button");option.type="button";option.className="conversation-option"+(selected?" selected":"");option.dataset.id=item.id;option.setAttribute("role","option");option.setAttribute("aria-selected",selected?"true":"false");option.setAttribute("aria-pressed",selected?"true":"false");option.innerHTML='<span class="checkmark">✓</span><span class="conversation-label"></span><span class="conversation-id"></span>';option.querySelector(".conversation-label").textContent=(item.type==="group"?"[群聊] ":item.type==="private"?"[私聊] ":item.type==="system"?"[系统] ":"")+item.name;option.querySelector(".conversation-id").textContent=item.id;option.addEventListener("click",function(){toggleConversation(this.dataset.id)});list.appendChild(option)}}
+async function loadConversations(entries){var d=await api("/api/conversations?_="+Date.now());conversationOptions=d.conversations||[];var pending=new Set(entries),manual=[];selectedConversationIds.clear();for(var i=0;i<conversationOptions.length;i++){var item=conversationOptions[i];if(pending.has(item.id)||pending.has(item.name)){selectedConversationIds.add(item.id);pending.delete(item.id);pending.delete(item.name)}}pending.forEach(function(value){manual.push(value)});document.querySelector("#inboundManualEntries").value=manual.join("\n");renderConversationOptions()}
+async function load(){var d=await api("/api/config?_="+Date.now());configured=d;var allow=listEntries(d.values.LOCAL_INBOUND_ALLOWLIST),block=listEntries(d.values.LOCAL_INBOUND_BLOCKLIST),mode=allow.length?"allow":block.length?"block":"all",active=mode==="allow"?allow:mode==="block"?block:[];var ks=Object.keys(d.values);for(var i=0;i<ks.length;i++){var key=ks[i],val=d.values[key];var el=form.elements[key];if(!el||key==="LOCAL_INBOUND_ALLOWLIST"||key==="LOCAL_INBOUND_BLOCKLIST")continue;if(d.secrets.indexOf(key)>=0)continue;if(key==="FILE_MAX_BYTES"){var mb=Number(val||0)/1048576;el.value=Number.isFinite(mb)?String(Math.round(mb*1000)/1000):"200"}else{el.value=val||""}}setFilterMode(mode);secretState("WEBUI_PASSWORD","#passwordHint","本机访问可留空");updateWarnings();await Promise.all([loadStatus(),loadCredentials(),loadWechatKeyStatus(),loadConversations(active)])}
 async function loadStatus(){try{var s=await api("/api/status");var dot=document.querySelector("#statusDot");var cd=document.querySelector("#statusCardDot");dot.className="dot "+s.state;if(cd)cd.className="dot "+s.state;document.querySelector("#statusText").textContent=s.label;var cl=document.querySelector("#statusCardLabel");if(cl)cl.textContent=s.label;var cdl=document.querySelector("#statusCardDetail");if(cdl)cdl.textContent=s.detail||"WeMai 运行状态";document.querySelector("#runtimeLine").textContent=s.detail||"WeMai 运行状态"}catch(e){document.querySelector("#statusText").textContent="状态不可用"}}
 async function loadLogs(){var le=document.getElementById("logLines");var l=le?le.value:200;try{var d=await api("/api/logs?lines="+l+"&_="+Date.now());var lg=d.log||{};var info=document.getElementById("logInfo");if(lg.exists){info.textContent="最近 "+lg.shown+" 行 · "+fmtSize(lg.size);document.getElementById("logFileInfo").textContent="("+fmtSize(lg.size)+")"}else{info.textContent="日志文件不存在";document.getElementById("logFileInfo").textContent="(文件不存在)"}allLogLines=lg.lines||[];renderLogs(allLogLines)}catch(err){document.getElementById("logOutput").innerHTML='<div class="log-empty">加载日志失败: '+err.message+"</div>"}}
 var curFilter="ALL";function filterLogs(){curFilter=document.getElementById("logLevelFilter").value;renderLogs(allLogLines)}
@@ -426,12 +607,15 @@ function startAutoRefresh(){stopAutoRefresh();autoRefreshTimer=setInterval(funct
 function stopAutoRefresh(){if(autoRefreshTimer){clearInterval(autoRefreshTimer);autoRefreshTimer=null}}
 function escHtml(t){var d=document.createElement("div");d.appendChild(document.createTextNode(t));return d.innerHTML}
 function fmtSize(b){if(b<1024)return b+" B";if(b<1048576)return(b/1024).toFixed(1)+" KB";return(b/1048576).toFixed(1)+" MB"}
-form.addEventListener("change",updateWarnings);form.elements.WEBUI_HOST.addEventListener("input",updateWarnings);
-form.addEventListener("submit",async function(e){e.preventDefault();var b=document.querySelector("#save");b.disabled=true;var pl={};var ks=Object.keys(configured.values);for(var i=0;i<ks.length;i++){var key=ks[i],el=form.elements[key];if(!el)continue;pl[key]=el.value}try{await api("/api/save",{method:"POST",body:JSON.stringify(pl)});notify("配置已保存，重启后生效","success");form.elements.WEFLOW_API_TOKEN.value="";form.elements.WEBUI_PASSWORD.value="";await load()}catch(err){notify(err.message,"error")}finally{b.disabled=false}});
+form.addEventListener("change",updateWarnings);form.elements.WEBUI_HOST.addEventListener("input",updateWarnings);document.querySelector("#inboundFilterMode").addEventListener("change",updateFilterPicker);document.querySelector("#conversationSearch").addEventListener("input",renderConversationOptions);
+form.addEventListener("submit",async function(e){e.preventDefault();var b=document.querySelector("#save");b.disabled=true;var pl={};var ks=Object.keys(configured.values);for(var i=0;i<ks.length;i++){var key=ks[i],el=form.elements[key];if(!el||key==="LOCAL_INBOUND_ALLOWLIST"||key==="LOCAL_INBOUND_BLOCKLIST")continue;if(key==="FILE_MAX_BYTES"){var mb=Number(el.value);if(!Number.isFinite(mb)||mb<=0||mb>200){notify("普通文件上限必须大于 0 且不超过 200 MB","error");b.disabled=false;return}pl[key]=String(Math.max(1,Math.round(mb*1048576)))}else{pl[key]=el.value}}var entries=selectedConversationEntries();entries.push.apply(entries,listEntries(document.querySelector("#inboundManualEntries").value));entries=Array.from(new Set(entries));var mode=filterMode();pl.LOCAL_INBOUND_ALLOWLIST=mode==="allow"?entries.join("\n"):"";pl.LOCAL_INBOUND_BLOCKLIST=mode==="block"?entries.join("\n"):"";try{await api("/api/save",{method:"POST",body:JSON.stringify(pl)});notify("配置已保存，重启后生效","success");form.elements.WEBUI_PASSWORD.value="";await load()}catch(err){notify(err.message,"error")}finally{b.disabled=false}});
 async function control(action,question,message){if(question&&!confirm(question))return;var b=document.querySelector("#"+action);b.disabled=true;try{await api("/api/"+action,{method:"POST",body:"{}"});notify(message,"success");setTimeout(loadStatus,900)}catch(err){notify(err.message,"error")}finally{setTimeout(function(){b.disabled=false},900)}}
 document.querySelector("#start").addEventListener("click",function(){control("start","立即启动 WeMai?","正在启动 WeMai")});
 document.querySelector("#stop").addEventListener("click",function(){control("stop","立即停止 WeMai?发送任务会先安全结束，并关闭独立窗口。","正在安全停止 WeMai")});
 document.querySelector("#restart").addEventListener("click",function(){control("restart","立即重启 WeMai?当前发送任务会先安全停止。","正在重启 WeMai，页面稍后会重新连接")});
+document.querySelector("#shutdown").addEventListener("click",function(){control("shutdown","完全退出 WeMai?核心服务、WebUI 和监督器都会关闭；再次使用需要重新双击 Start-WeMai.vbs。","正在完全退出 WeMai，页面断开属于正常现象")});
+document.querySelector("#saveCredentials").addEventListener("click",saveCredentials);
+document.querySelector("#acquireWechatKey").addEventListener("click",acquireWechatKey);
 load().catch(function(err){notify(err.message,"error")});setInterval(loadStatus,3000);
 </script>
 </body></html>
@@ -496,6 +680,12 @@ class ConfigWebUIServer:
         start_callback: Callable[[], None] | None = None,
         stop_callback: Callable[[], None] | None = None,
         restart_callback: Callable[[], None] | None = None,
+        shutdown_callback: Callable[[], None] | None = None,
+        credentials_path: os.PathLike[str] | str | None = None,
+        id_map_path: os.PathLike[str] | str | None = None,
+        local_inbound_node_path: os.PathLike[str] | str | None = None,
+        conversation_helper_path: os.PathLike[str] | str | None = None,
+        wechat_key_bootstrap=None,
     ):
         self.env_path = Path(env_path)
         self.host = host
@@ -507,19 +697,54 @@ class ConfigWebUIServer:
         self.start_callback = start_callback
         self.stop_callback = stop_callback
         self.restart_callback = restart_callback
+        self.shutdown_callback = shutdown_callback
+        self.credentials_path = Path(credentials_path or (
+            Path(__file__).resolve().parent / "data" / "local_inbound_credentials.json"
+        ))
+        self.id_map_path = Path(id_map_path or (
+            Path(__file__).resolve().parent / "wemai_id_map.sqlite3"
+        ))
+        self.local_inbound_node_path = Path(local_inbound_node_path or (
+            Path(__file__).resolve().parent / "local_inbound" / "runtime" / "node.exe"
+        ))
+        self.conversation_helper_path = Path(conversation_helper_path or (
+            Path(__file__).resolve().parent / "local_inbound" / "list-conversations.js"
+        ))
+        self.wechat_key_bootstrap = wechat_key_bootstrap
+        self._wechat_key_lock = threading.Lock()
         self._sessions: set[str] = set()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-
-    @property
-    def optional_features_available(self) -> bool:
-        executable = Path(__file__).resolve().parent / "extensions" / "WeChatAutoServer" / "Server.exe"
-        return executable.is_file()
+        self._conversation_cache: list[dict[str, object]] = []
+        self._conversation_cache_expires = 0.0
+        self._conversation_cache_lock = threading.Lock()
 
     @property
     def url(self) -> str:
         display_host = "127.0.0.1" if self.host in {"0.0.0.0", "::"} else self.host
         return f"http://{display_host}:{self.port}/"
+
+    def conversation_options(self) -> list[dict[str, object]]:
+        """短暂缓存通讯录，避免 WebUI 搜索每次按键都重新解密数据库。"""
+
+        now = time.monotonic()
+        with self._conversation_cache_lock:
+            if self._conversation_cache_expires > now:
+                return list(self._conversation_cache)
+        options = load_conversation_options(
+            self.id_map_path,
+            credentials_path=self.credentials_path,
+            node_path=self.local_inbound_node_path,
+            helper_path=self.conversation_helper_path,
+        )
+        with self._conversation_cache_lock:
+            self._conversation_cache = list(options)
+            self._conversation_cache_expires = time.monotonic() + 10.0
+        return options
+
+    def invalidate_conversation_cache(self) -> None:
+        with self._conversation_cache_lock:
+            self._conversation_cache_expires = 0.0
 
     def _make_handler(self):
         owner = self
@@ -654,16 +879,52 @@ class ConfigWebUIServer:
                     self._send(HTTPStatus.OK, HTML.encode("utf-8"), "text/html; charset=utf-8")
                 elif path == "/api/config":
                     values = read_env_file(owner.env_path)
-                    public = {key: ("" if key in SECRET_KEYS else values[key]) for key in EDITABLE_KEYS}
+                    public = {
+                        key: "" if key in SECRET_KEYS else values[key]
+                        for key in EDITABLE_KEYS
+                    }
                     configured = [key for key in SECRET_KEYS if values.get(key)]
                     self._json(HTTPStatus.OK, {
                         "values": public,
                         "secrets": sorted(SECRET_KEYS),
                         "configuredSecrets": sorted(configured),
-                        "optionalFeaturesAvailable": owner.optional_features_available,
                     })
+                elif path == "/api/credentials":
+                    try:
+                        credentials = load_credentials(owner.credentials_path)
+                        payload = {
+                            "configured": True,
+                            "accountDir": credentials["account_dir"],
+                            "wxid": credentials["wxid"],
+                            "databaseKey": credentials["db_key"],
+                            "databaseKeyConfigured": bool(credentials["db_key"]),
+                            "imageXorKeyConfigured": bool(credentials["image_xor_key"]),
+                            "imageAesKeyConfigured": bool(credentials["image_aes_key"]),
+                        }
+                    except (CredentialError, OSError):
+                        payload = {
+                            "configured": False,
+                            "accountDir": "",
+                            "wxid": "",
+                            "databaseKey": "",
+                            "databaseKeyConfigured": False,
+                            "imageXorKeyConfigured": False,
+                            "imageAesKeyConfigured": False,
+                        }
+                    self._json(HTTPStatus.OK, payload)
                 elif path == "/api/status":
                     self._json(HTTPStatus.OK, owner.status_provider())
+                elif path == "/api/wechat-key/status":
+                    if owner.wechat_key_bootstrap is None:
+                        raise ValueError("自动获取密钥助手不可用，请使用手工配置")
+                    self._json(
+                        HTTPStatus.OK,
+                        owner.wechat_key_bootstrap.status().to_public_dict(),
+                    )
+                elif path == "/api/conversations":
+                    self._json(HTTPStatus.OK, {
+                        "conversations": owner.conversation_options(),
+                    })
                 elif path == "/health":
                     self._json(HTTPStatus.OK, {"ok": True})
                 elif path == "/api/logs":
@@ -700,19 +961,63 @@ class ConfigWebUIServer:
                         for key in SECRET_KEYS:
                             if supplied.get(key, None) == "":
                                 supplied.pop(key, None)
-                        if not owner.optional_features_available and any(
-                            _parse_bool_value(supplied.get(key, False))
-                            for key in BOOL_KEYS
-                        ):
-                            raise ValueError("当前为核心版，请先安装联系人/群管理扩展包")
                         updates = validate_updates(supplied, current)
                         update_env_file(owner.env_path, updates)
                         self._json(HTTPStatus.OK, {"ok": True, "restartRequired": True})
-                    elif path in {"/api/start", "/api/stop", "/api/restart"}:
+                    elif path == "/api/credentials":
+                        supplied = self._read_json()
+                        if not isinstance(supplied, dict):
+                            raise ValueError("凭据数据必须是对象")
+                        existing = {}
+                        with contextlib.suppress(CredentialError, OSError):
+                            existing = load_credentials(owner.credentials_path)
+
+                        def value(name, existing_name):
+                            current_value = str(supplied.get(name) or "").strip()
+                            return current_value or str(existing.get(existing_name) or "")
+
+                        save_credentials(
+                            owner.credentials_path,
+                            account_dir=value("accountDir", "account_dir"),
+                            wxid=value("wxid", "wxid"),
+                            db_key=value("databaseKey", "db_key"),
+                            image_xor_key=value("imageXorKey", "image_xor_key"),
+                            image_aes_key=value("imageAesKey", "image_aes_key"),
+                        )
+                        # 立即回读校验 DPAPI 密文和路径，但不返回任何密钥。
+                        verified = load_credentials(owner.credentials_path)
+                        owner.invalidate_conversation_cache()
+                        self._json(HTTPStatus.OK, {
+                            "ok": True,
+                            "restartRequired": True,
+                            "wxid": verified["wxid"],
+                            "accountDir": verified["account_dir"],
+                        })
+                    elif path == "/api/wechat-key/acquire":
+                        if owner.wechat_key_bootstrap is None:
+                            raise ValueError("自动获取密钥助手不可用，请使用手工配置")
+                        supplied = self._read_json()
+                        account_id = str(supplied.get("accountId") or "").strip()
+                        if not account_id:
+                            raise ValueError("请选择微信账号")
+                        if not owner._wechat_key_lock.acquire(blocking=False):
+                            self._json(
+                                HTTPStatus.CONFLICT,
+                                {"error": "正在获取密钥，请勿重复操作"},
+                            )
+                            return
+                        try:
+                            result = owner.wechat_key_bootstrap.acquire_and_save(account_id)
+                        finally:
+                            owner._wechat_key_lock.release()
+                        owner.invalidate_conversation_cache()
+                        self._json(HTTPStatus.OK, result)
+                    elif path in {"/api/start", "/api/stop", "/api/restart", "/api/shutdown"}:
                         callbacks = {
                             "/api/start": owner.start_callback,
                             "/api/stop": owner.stop_callback,
                             "/api/restart": owner.restart_callback,
+                            "/api/shutdown": owner.shutdown_callback,
                         }
                         callback = callbacks[path]
                         if callback is None:
@@ -721,7 +1026,7 @@ class ConfigWebUIServer:
                         callback()
                     else:
                         self._json(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
-                except (ValueError, json.JSONDecodeError) as exc:
+                except (CredentialError, WechatKeyError, ValueError, json.JSONDecodeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 except Exception:
                     self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "服务器内部错误"})

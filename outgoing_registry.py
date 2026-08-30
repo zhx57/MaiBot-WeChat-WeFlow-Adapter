@@ -1,4 +1,4 @@
-"""线程安全地关联出站消息与 WeFlow 随后推送的同内容回声。"""
+"""线程安全地关联 UI 出站消息与随后出现的同内容本地回声。"""
 
 import re
 import threading
@@ -34,7 +34,7 @@ class _OutgoingRecord:
 
 
 class OutgoingMessageRegistry:
-    """在点击发送前预登记内容，防止极快的 SSE 回声先于登记到达。
+    """在点击发送前预登记内容，防止极快的本地回声先于登记到达。
 
     ``reserve`` 只建立短期记录；确认微信已执行发送后调用 ``commit``，明确失败
     则调用 ``cancel``。这种两阶段登记避免机器人把自己的消息再次当作用户入站，

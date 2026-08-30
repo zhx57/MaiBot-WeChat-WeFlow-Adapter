@@ -11,10 +11,31 @@ import time
 from pathlib import Path
 
 from config_webui import ConfigWebUIServer, read_env_file
+from local_inbound_credentials import CredentialError, load_credentials
+from wechat_key_bootstrap import WechatKeyBootstrap
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
 RELOAD_REQUESTED = 75
+
+
+def format_uptime(seconds: int | float) -> str:
+    """按月、天、小时、分钟、秒显示时长，并省略前导零单位。"""
+
+    remaining = max(0, int(seconds))
+    units = (
+        (30 * 24 * 60 * 60, "月"),
+        (24 * 60 * 60, "天"),
+        (60 * 60, "小时"),
+        (60, "分钟"),
+        (1, "秒"),
+    )
+    values: list[tuple[int, str]] = []
+    for size, label in units:
+        value, remaining = divmod(remaining, size)
+        values.append((value, label))
+    first = next((index for index, (value, _) in enumerate(values) if value), len(values) - 1)
+    return "".join(f"{value}{label}" for value, label in values[first:])
 
 
 class Supervisor:
@@ -33,6 +54,12 @@ class Supervisor:
         self.last_exit_code: int | None = None
         self.restart_count = 0
         self.control_error = ""
+        credentials_path = ROOT / "data" / "local_inbound_credentials.json"
+        key_bootstrap = WechatKeyBootstrap(
+            credentials_path=credentials_path,
+            node_path=ROOT / "local_inbound" / "runtime" / "node.exe",
+            verifier_path=ROOT / "local_inbound" / "verify-database-key.js",
+        )
         self.webui = ConfigWebUIServer(
             ENV_PATH,
             values["WEBUI_HOST"],
@@ -42,6 +69,11 @@ class Supervisor:
             start_callback=self.start_requested.set,
             stop_callback=self.child_stop_requested.set,
             restart_callback=self.restart_requested.set,
+            shutdown_callback=self.shutdown_from_webui,
+            credentials_path=credentials_path,
+            local_inbound_node_path=ROOT / "local_inbound" / "runtime" / "node.exe",
+            conversation_helper_path=ROOT / "local_inbound" / "list-conversations.js",
+            wechat_key_bootstrap=key_bootstrap,
         )
 
     def status(self) -> dict:
@@ -65,7 +97,7 @@ class Supervisor:
             return {
                 "state": "running",
                 "label": "运行中",
-                "detail": f"核心进程 PID {child.pid}，已运行 {elapsed} 秒",
+                "detail": f"核心进程 PID {child.pid}，已运行 {format_uptime(elapsed)}",
             }
         if self.last_exit_code not in (None, 0):
             return {
@@ -125,9 +157,12 @@ class Supervisor:
         signal.signal(signal.SIGTERM, handle)
 
     def start_core_from_saved_config(self) -> bool:
-        values = read_env_file(ENV_PATH)
-        if not values.get("WEFLOW_API_TOKEN", "").strip():
-            self.control_error = "请先保存 WeFlow Token，再启动 WeMai"
+        try:
+            load_credentials(ROOT / "data" / "local_inbound_credentials.json")
+        except (CredentialError, OSError):
+            self.control_error = (
+                "本地数据库凭据尚未配置，请在 WebUI 的微信数据库解密区填写"
+            )
             print(f"[WeMai] 启动失败：{self.control_error}", flush=True)
             return False
         self.desired_running = True
@@ -144,6 +179,13 @@ class Supervisor:
         self.control_error = ""
         self.stop_child()
         print("[WeMai] 核心消息服务已停止，WebUI 保持运行。", flush=True)
+
+    def shutdown_from_webui(self) -> None:
+        """请求监督器在主循环中安全停止全部服务并退出。"""
+
+        self.control_error = ""
+        print("[WeMai] 收到 WebUI 完全退出请求，正在安全停止全部服务……", flush=True)
+        self.stop_requested.set()
 
     @staticmethod
     def _confirm_console_stop() -> bool:

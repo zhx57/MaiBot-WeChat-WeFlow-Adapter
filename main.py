@@ -1,11 +1,12 @@
 """WeMai 核心进程入口与运行生命周期管理。
 
 启动顺序为：配置日志 -> 启动可选扩展宿主 -> 启动 MaiBot Router ->
-启动微信 UI 工作线程 -> 建立 WeFlow SSE 入站连接。关闭时按相反顺序回收，
+启动微信 UI 工作线程 -> 建立所选微信入站连接。关闭时按相反顺序回收，
 避免消息仍在进入时先销毁投递端或微信窗口。
 
 本模块只负责组件编排和健康检查；消息格式转换在 ``wx_Processor.py``，
-WeFlow 协议解析在 ``weflow_listener.py``，微信 UI 操作在 ``wx_Listener.py``。
+本地数据库入站在 ``local_wechat_listener.py``，微信 UI 操作在
+``wx_Listener.py``。
 """
 
 import argparse
@@ -26,27 +27,33 @@ from config import (
     EXIT_LOG_FILE,
     EXIT_LOG_MAX_BYTES,
     IMAGE_AUTO_DOWNLOAD,
+    IMAGE_SAVE_DIR,
+    LOCAL_INBOUND_ALLOWLIST,
+    LOCAL_INBOUND_BLOCKLIST,
+    LOCAL_INBOUND_CREDENTIALS_FILE,
+    LOCAL_INBOUND_DISPATCH_WORKERS,
+    LOCAL_INBOUND_MEDIA_WAIT_SECONDS,
+    LOCAL_INBOUND_NATIVE_IMAGE_ADDON,
+    LOCAL_INBOUND_NODE,
+    LOCAL_INBOUND_POLL_INTERVAL_MS,
+    LOCAL_INBOUND_SCRIPT,
+    LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS,
+    LOCAL_INBOUND_STATE_FILE,
     LOG_BACKUP_COUNT,
     LOG_DATE_FORMAT,
     LOG_FILE,
     LOG_FORMAT,
     LOG_LEVEL,
     LOG_MAX_BYTES,
-    OPTIONAL_CONTACTS_ENABLED,
-    OPTIONAL_GROUPS_ENABLED,
-    OPTIONAL_HOST_PORT,
     UI_WORKER_AUTO_RESTART,
     UI_WORKER_BUSY_TIMEOUT_SECONDS,
     UI_WORKER_IDLE_TIMEOUT_SECONDS,
     UI_WORKER_STARTUP_TIMEOUT_SECONDS,
-    WEFLOW_API_TOKEN,
-    WEFLOW_API_URL,
     print_config_info,
 )
-from optional_host_manager import OptionalFeatureHost
+from local_wechat_listener import LocalWechatListener
 from outgoing_registry import OutgoingMessageRegistry
 from voice_host_backend import OutboundUIGate, WeMaiVoiceBackend
-from weflow_listener import WeFlowListener
 from wx_Listener import (
     UICommandQueue,
     WeChatListener,
@@ -131,7 +138,6 @@ def log_exit(reason, exc=None):
     ui_thread = _runtime.get("ui_thread")
     listener = state.get("listener")
     voice_backend = state.get("voice_backend")
-    optional_host = state.get("optional_host")
     heartbeat = state.get("heartbeat")
     heartbeat_age = now - heartbeat if heartbeat is not None else None
     router_thread = getattr(processor, "_thread", None)
@@ -181,12 +187,6 @@ def log_exit(reason, exc=None):
         ),
         "voice_host_error": (
             repr(voice_backend.last_error) if voice_backend else None
-        ),
-        "optional_host_running": (
-            optional_host.is_running if optional_host else False
-        ),
-        "optional_host_error": (
-            repr(optional_host.last_error) if optional_host else None
         ),
     }
     exc_info = (type(exc), exc, exc.__traceback__) if exc is not None else None
@@ -426,6 +426,12 @@ async def main(args, *, runtime=None, stop_event=None):
     if runtime is None:
         runtime = {"started": time.monotonic(), "state": None, "processor": None,
                    "ui_thread": None, "shutdown_reason": None}
+    else:
+        runtime.setdefault("started", time.monotonic())
+        runtime.setdefault("state", None)
+        runtime.setdefault("processor", None)
+        runtime.setdefault("ui_thread", None)
+        runtime.setdefault("shutdown_reason", None)
     if stop_event is None:
         stop_event = threading.Event()
     else:
@@ -445,11 +451,10 @@ async def main(args, *, runtime=None, stop_event=None):
     _register_shutdown_signals(_signal_handler)
     inbound = not args.maibot_to_wx
     outbound = not args.wx_to_maibot
-    # WeFlow 自己负责黑白名单，WeMai 始终接收它推送的全部会话。
+    # 本地数据库读取全部会话；sidecar 在媒体处理前应用可选黑白名单。
     targets = []
     commands = UICommandQueue()
     outgoing_registry = OutgoingMessageRegistry()
-    weflow_inbound = inbound
     ui_inbound = False
     outbound_ui_gate = OutboundUIGate() if outbound else None
     voice_backend = (
@@ -459,11 +464,6 @@ async def main(args, *, runtime=None, stop_event=None):
         )
         if outbound
         else None
-    )
-    optional_host = OptionalFeatureHost(
-        contacts=OPTIONAL_CONTACTS_ENABLED,
-        groups=OPTIONAL_GROUPS_ENABLED,
-        port=OPTIONAL_HOST_PORT,
     )
     outbound_submit = (
         voice_backend.submit
@@ -485,9 +485,9 @@ async def main(args, *, runtime=None, stop_event=None):
     )
     set_global_processor(processor)
     ui_thread = None
-    weflow_listener = None
+    inbound_listener = None
     state = {"ready": threading.Event(), "error": None, "listener": None,
-             "weflow_listener": None,
+             "inbound_listener": None,
              "outgoing_registry": outgoing_registry,
              "listening_targets": [],
              "heartbeat": time.monotonic(),
@@ -495,14 +495,11 @@ async def main(args, *, runtime=None, stop_event=None):
              "ui_exit_reason": None, "router_warning_at": 0,
              "phase": "pending"}
     state["voice_backend"] = voice_backend
-    state["optional_host"] = optional_host
     _runtime.update({"state": state, "processor": processor, "ui_thread": None})
     failure = None
     try:
         if voice_backend is not None:
             await asyncio.to_thread(voice_backend.start)
-        if optional_host.enabled:
-            await asyncio.to_thread(optional_host.start)
         processor.start(timeout=20)
         logger.info("Router WebSocket 已连接")
         if ui_required:
@@ -525,33 +522,43 @@ async def main(args, *, runtime=None, stop_event=None):
         else:
             state["phase"] = "running_without_ui"
 
-        if weflow_inbound:
-            # 把 WeFlow 真 ID 和最新名称交给窗口层，改名后仍能命中原 HWND。
+        if inbound:
+            # 把入站真 ID 和最新名称交给窗口层，改名后仍能命中原 HWND。
             def _record_recent_inbound(chat_name, session_id="", chat_type=""):
                 listener = state.get("listener")
                 recorder = getattr(listener, "record_recent_inbound", None)
                 if recorder is not None:
                     recorder(chat_name, session_id, chat_type)
 
-            weflow_listener = WeFlowListener(
-                target_chats=[],
+            inbound_listener = LocalWechatListener(
                 callback=processor.enqueue_inbound_event,
                 stop_event=stop_event,
-                api_url=WEFLOW_API_URL,
-                api_token=WEFLOW_API_TOKEN,
-                outgoing_registry=outgoing_registry,
+                credentials_file=LOCAL_INBOUND_CREDENTIALS_FILE,
+                node_executable=LOCAL_INBOUND_NODE,
+                sidecar_script=LOCAL_INBOUND_SCRIPT,
+                media_dir=IMAGE_SAVE_DIR,
+                state_file=LOCAL_INBOUND_STATE_FILE,
+                native_image_addon=LOCAL_INBOUND_NATIVE_IMAGE_ADDON,
+                dispatch_workers=LOCAL_INBOUND_DISPATCH_WORKERS,
+                poll_interval_ms=LOCAL_INBOUND_POLL_INTERVAL_MS,
+                media_wait_seconds=LOCAL_INBOUND_MEDIA_WAIT_SECONDS,
+                allowlist=LOCAL_INBOUND_ALLOWLIST,
+                blocklist=LOCAL_INBOUND_BLOCKLIST,
                 recency_recorder=_record_recent_inbound,
-                known_message_checker=processor.is_inbound_known,
+                account_profile_callback=processor.observe_account_profile,
             )
-            state["weflow_listener"] = weflow_listener
-            await asyncio.to_thread(weflow_listener.start, 20)
+            state["inbound_listener"] = inbound_listener
+            await asyncio.to_thread(
+                inbound_listener.start,
+                LOCAL_INBOUND_STARTUP_TIMEOUT_SECONDS,
+            )
 
         logger.info("服务已就绪 mode=%s inbound_source=%s configured_chats=%s "
                     "listening_chats=%s "
                     "image_auto_download=%s watchdog_idle=%ss "
                     "watchdog_busy=%ss auto_restart=%s",
                     "双向" if inbound and outbound else ("微信到MaiBot" if inbound else "MaiBot到微信"),
-                    "weflow" if weflow_inbound else ("ui" if ui_inbound else "disabled"),
+                    "local-database" if inbound else ("ui" if ui_inbound else "disabled"),
                     targets, state["listening_targets"],
                     IMAGE_AUTO_DOWNLOAD,
                     UI_WORKER_IDLE_TIMEOUT_SECONDS,
@@ -566,21 +573,16 @@ async def main(args, *, runtime=None, stop_event=None):
                     raise error from state["error"]
                 log_exit(state["ui_exit_reason"] or "UI worker 未知原因结束")
                 break
-            if weflow_listener is not None and not weflow_listener.is_running:
+            if inbound_listener is not None and not inbound_listener.is_running:
                 stop_event.set()
-                error = weflow_listener.startup_error
-                log_exit("WeFlow SSE worker 异常结束", error)
-                raise RuntimeError("WeFlow SSE worker 异常结束") from error
+                error = inbound_listener.startup_error
+                log_exit("微信入站 worker 异常结束", error)
+                raise RuntimeError("微信入站 worker 异常结束") from error
             if voice_backend is not None and not voice_backend.is_running:
                 stop_event.set()
                 error = voice_backend.last_error
                 log_exit("WeMai 语音宿主异常结束", error)
                 raise RuntimeError("WeMai 语音宿主异常结束") from error
-            if optional_host.enabled and not optional_host.is_running:
-                stop_event.set()
-                error = optional_host.last_error
-                log_exit("OCR 高级扩展异常结束", error)
-                raise RuntimeError("OCR 高级扩展异常结束") from error
             if processor._thread and not processor._thread.is_alive():
                 stop_event.set()
                 log_exit("主循环检测到 Router worker 异常结束", processor.startup_error)
@@ -612,13 +614,11 @@ async def main(args, *, runtime=None, stop_event=None):
     finally:
         stop_event.set()
         stalled = isinstance(failure, UIWorkerStalledError)
-        if weflow_listener is not None:
-            weflow_listener.close(timeout=2 if stalled else 10)
+        if inbound_listener is not None:
+            inbound_listener.close(timeout=2 if stalled else 10)
         processor.stop(timeout=2 if stalled else 15)
         if voice_backend is not None:
             voice_backend.close(timeout=2 if stalled else 10)
-        if optional_host.enabled:
-            optional_host.close(timeout=2 if stalled else 10)
         if ui_thread:
             join_timeout = 1 if stalled else 10
             ui_thread.join(timeout=join_timeout)

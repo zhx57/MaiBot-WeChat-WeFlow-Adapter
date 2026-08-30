@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 REQUIREMENTS = ROOT / "requirements.txt"
+CONSTRAINTS = ROOT / "constraints-win-py312.txt"
+WHEELHOUSE = ROOT / "wheelhouse"
+WHEELHOUSE_MANIFEST = WHEELHOUSE / "SHA256SUMS.txt"
 STAMP = VENV / ".wemai_requirements.sha256"
+SUPPORTED_PYTHON = (3, 12)
 
 
 def set_console_title() -> None:
@@ -30,8 +35,78 @@ def venv_python() -> Path:
     return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def requirements_hash() -> str:
-    return hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()
+def dependency_bundle_hash() -> str:
+    """Bind the venv stamp to both requirements and the offline wheel set."""
+    digest = hashlib.sha256()
+    digest.update(REQUIREMENTS.read_bytes())
+    digest.update(CONSTRAINTS.read_bytes())
+    if WHEELHOUSE_MANIFEST.exists():
+        digest.update(WHEELHOUSE_MANIFEST.read_bytes())
+    return digest.hexdigest()
+
+
+def validate_host_python() -> None:
+    """Offline wheels are built for 64-bit CPython 3.12 on Windows."""
+    current = sys.version_info[:2]
+    if os.name != "nt" or current != SUPPORTED_PYTHON or struct.calcsize("P") != 8:
+        raise RuntimeError(
+            "离线版需要 Windows x64 和 64 位 Python 3.12；"
+            f"当前为 {sys.platform} / Python {sys.version.split()[0]} / "
+            f"{struct.calcsize('P') * 8} 位"
+        )
+
+
+def verify_wheelhouse() -> list[Path]:
+    if not WHEELHOUSE_MANIFEST.is_file():
+        raise RuntimeError(f"离线依赖校验清单不存在：{WHEELHOUSE_MANIFEST}")
+    verified: list[Path] = []
+    for line_number, raw_line in enumerate(
+        WHEELHOUSE_MANIFEST.read_text(encoding="ascii").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise RuntimeError(f"离线依赖校验清单第 {line_number} 行格式错误")
+        expected_hash, filename = parts
+        wheel = WHEELHOUSE / filename.strip()
+        if wheel.parent != WHEELHOUSE or wheel.suffix.lower() != ".whl" or not wheel.is_file():
+            raise RuntimeError(f"离线依赖文件缺失或路径非法：{filename}")
+        digest = hashlib.sha256()
+        with wheel.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest().lower() != expected_hash.lower():
+            raise RuntimeError(f"离线依赖校验失败：{filename}")
+        verified.append(wheel)
+    if not verified:
+        raise RuntimeError("离线依赖校验清单为空")
+    return verified
+
+
+def offline_install_command(python: Path) -> list[str]:
+    if not WHEELHOUSE.is_dir() or not any(WHEELHOUSE.glob("*.whl")):
+        raise RuntimeError(f"离线依赖目录不存在或为空：{WHEELHOUSE}")
+    if not CONSTRAINTS.is_file():
+        raise RuntimeError(f"离线依赖版本锁不存在：{CONSTRAINTS}")
+    verify_wheelhouse()
+    return [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-index",
+        "--only-binary=:all:",
+        "--find-links",
+        str(WHEELHOUSE),
+        "--constraint",
+        str(CONSTRAINTS),
+        "-r",
+        str(REQUIREMENTS),
+    ]
 
 
 def run_checked(command: list[str], description: str) -> None:
@@ -56,17 +131,14 @@ def inspect_dependencies(python: Path) -> list[dict[str, str]]:
 
 
 def ensure_environment() -> Path:
-    if sys.version_info < (3, 9):  # noqa: UP036 - 启动器需要给旧 Python 明确中文提示
-        raise RuntimeError(
-            f"需要 Python 3.9 或更高版本，当前为 {sys.version.split()[0]}"
-        )
+    validate_host_python()
     python = venv_python()
     if not python.exists():
         print(f"[WeMai 安装] 未找到项目虚拟环境：{VENV}", flush=True)
         run_checked([sys.executable, "-m", "venv", str(VENV)], "创建项目虚拟环境")
 
     missing = inspect_dependencies(python)
-    current_hash = requirements_hash()
+    current_hash = dependency_bundle_hash()
     stamp_changed = not STAMP.exists() or STAMP.read_text(encoding="ascii").strip() != current_hash
     if missing:
         print("[WeMai 安装] 检测到以下缺少或版本不符的依赖：", flush=True)
@@ -82,10 +154,7 @@ def ensure_environment() -> Path:
 
     if missing or stamp_changed:
         run_checked(
-            [
-                str(python), "-m", "pip", "install",
-                "--disable-pip-version-check", "-r", str(REQUIREMENTS),
-            ],
+            offline_install_command(python),
             "自动安装 Python 依赖",
         )
         remaining = inspect_dependencies(python)
@@ -108,10 +177,15 @@ def prepare_env_file() -> bool:
     return True
 
 
-def has_weflow_token() -> bool:
-    from config_webui import read_env_file
+def has_local_inbound_credentials() -> bool:
+    """只验证 DPAPI 凭据可用，不打印账号路径或任何密钥。"""
+    try:
+        from local_inbound_credentials import load_credentials
 
-    return bool(read_env_file(ROOT / ".env").get("WEFLOW_API_TOKEN", "").strip())
+        load_credentials(ROOT / "data" / "local_inbound_credentials.json")
+        return True
+    except Exception:
+        return False
 
 
 def main(argv=None) -> int:
@@ -119,7 +193,7 @@ def main(argv=None) -> int:
     try:
         python = ensure_environment()
         prepare_env_file()
-        config_only = not has_weflow_token()
+        config_only = not has_local_inbound_credentials()
         supervisor_args = [str(python), str(ROOT / "wemai_supervisor.py")]
         if config_only:
             supervisor_args.append("--config-only")

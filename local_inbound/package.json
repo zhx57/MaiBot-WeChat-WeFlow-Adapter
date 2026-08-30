@@ -1,0 +1,20 @@
+{
+  "name": "wemai-local-wechat-inbound",
+  "version": "1.0.1",
+  "private": true,
+  "description": "WeMai 本地只读微信消息入站模块",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "audit-mapping": "node tools/audit-mapping.js",
+    "start": "node local-inbound.js",
+    "probe": "node tools/probe-database.js",
+    "schema": "node tools/schema-summary.js"
+  },
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "12.11.1",
+    "fast-xml-parser": "^5.7.0",
+    "fzstd": "^0.1.1",
+    "silk-wasm": "^3.7.1"
+  }
+}

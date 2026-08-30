@@ -4,37 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wemai"
-version = "0.4.0"
-description = "WeFlow、MaiBot 与微信独立窗口收发的一体化 WeMai 桥接服务。"
+version = "1.0.2"
+description = "MaiBot 与微信本地数据库、独立窗口收发的一体化适配器。"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.12,<3.13"
 authors = [
     { name = "zhx57" },
 ]
-keywords = ["maibot", "wechat", "weflow", "adapter"]
+keywords = ["maibot", "wechat", "adapter"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: Developers",
     "License :: Other/Proprietary License",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
     "wx4py==0.2.1",
-    "Pillow>=10.0.0",
-    "pyperclip>=1.9.0",
-    "websockets>=12.0",
+    "Pillow==12.3.0",
+    "pyperclip==1.11.0",
+    "websockets==16.1.1",
     "maim_message==0.6.8",
-    "aiofiles>=23.0",
-    "python-dotenv>=1.0.0",
+    "aiofiles==25.1.0",
+    "python-dotenv==1.2.2",
 ]
 
 [project.optional-dependencies]
@@ -57,9 +53,12 @@ py-modules = [
     "config",
     "dependency_check",
     "main",
+    "local_inbound_credentials",
+    "local_inbound_setup",
+    "local_wechat_listener",
     "outgoing_registry",
-    "optional_host_manager",
-    "weflow_listener",
+    "sender_identity_aliases",
+    "unicode_utils",
     "wx_Listener",
     "wx_Processor",
     "wx_exceptions",
@@ -67,6 +66,7 @@ py-modules = [
     "audio_segments",
     "config_webui",
     "wemai_supervisor",
+    "wechat_key_bootstrap",
 ]
 
 [tool.pytest.ini_options]
@@ -103,8 +103,11 @@ exclude_lines = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py312"
 extend-exclude = [
+    ".venv",
+    "wheelhouse",
+    "local_inbound/node_modules",
     "wx4py_ref",
     "wxauto40_ref",
     "build",
@@ -130,4 +133,3 @@ ignore = [
 "tests/*" = ["E402", "B011"]
 "wx_Listener.py" = ["E402", "B008", "B904"]
 "wx_Processor.py" = ["E402", "B008"]
-"weflow_listener.py" = ["E402", "B008"]
